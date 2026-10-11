@@ -31,20 +31,29 @@
             <path d="m7 9 5-5 5 5" />
             <path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
           </svg>
-          <p class="dz-title">拖入照片，或点击选择</p>
-          <p class="dz-sub">支持 JPG / PNG · 自动读取 EXIF 拍摄信息</p>
+          <p class="dz-title">拖入照片（可一次多张），或点击选择</p>
+          <p class="dz-sub">支持 JPG / PNG · 自动读取 EXIF 拍摄信息 · 批量共用同一套样式</p>
         </div>
-        <input type="file" id="fileInput" accept="image/*" hidden />
+        <input type="file" id="fileInput" accept="image/*" multiple hidden />
       </div>
 
       <div class="viewer hidden" id="viewer">
         <div class="viewer-bar">
           <span class="file-name" id="fileName"></span>
-          <button class="btn-ghost" id="changeBtn" type="button">更换图片</button>
+          <div class="viewer-actions">
+            <span class="batch-nav">
+              <button class="btn-icon" id="prevBtn" type="button" title="上一张（← 键）" aria-label="上一张" disabled>‹</button>
+              <span class="batch-pos" id="batchPos">1 / 1</span>
+              <button class="btn-icon" id="nextBtn" type="button" title="下一张（→ 键）" aria-label="下一张" disabled>›</button>
+            </span>
+            <button class="btn-ghost" id="addBtn" type="button">添加图片</button>
+            <button class="btn-ghost" id="changeBtn" type="button">更换图片</button>
+          </div>
         </div>
         <div class="canvas-wrap">
           <canvas id="previewCanvas"></canvas>
         </div>
+        <div class="batch-strip hidden" id="batchStrip" aria-label="批量队列"></div>
       </div>
 
       <div class="notice hidden" id="notice"></div>
@@ -267,7 +276,41 @@
         </div>
       </details>
 
-      <!-- ⑤ 导出 -->
+      <!-- ⑤ 批量队列 -->
+      <details class="sect" open>
+        <summary>
+          <span class="sect-title">批量队列</span>
+          <span class="badge badge-ok hidden" id="batchBadge">—</span>
+        </summary>
+        <div class="sect-body">
+          <div class="queue-head">
+            <span class="mini-status" id="queueSummary">尚未添加图片</span>
+            <button class="btn-tiny" id="clearBtn" type="button" disabled>清空</button>
+          </div>
+
+          <div class="progress hidden" id="prepProgress">
+            <div class="progress-bar"><i id="prepBar"></i></div>
+            <span class="mini-status" id="prepText">—</span>
+          </div>
+
+          <label class="check-row">
+            <input type="checkbox" id="geocodeChk" />
+            <span>批量反查地名（约每秒 1 张，遵循 OSM 使用条款）</span>
+          </label>
+
+          <div class="progress hidden" id="geoProgress">
+            <div class="progress-bar"><i id="geoBar"></i></div>
+            <span class="mini-status" id="geoText">—</span>
+          </div>
+
+          <p class="hint">
+            一批照片共用右侧所有样式设置；拍摄信息（EXIF / GPS）逐张读取，点下方缩略图即可切换检查，
+            也可以用 ← → 键切换。有 GPS 的照片默认先显示经纬度，反查地名需要联网、批量时较慢。
+          </p>
+        </div>
+      </details>
+
+      <!-- ⑥ 导出 -->
       <details class="sect" open>
         <summary><span class="sect-title">导出</span></summary>
         <div class="sect-body">
@@ -287,8 +330,34 @@
             <input type="range" id="qualityRange" min="0.5" max="1" step="0.01" value="0.92" />
           </div>
 
-          <button class="btn-primary" id="exportBtn" type="button" disabled>导出图片</button>
+          <button class="btn-primary" id="exportBtn" type="button" disabled>导出当前图片</button>
+
+          <div class="control">
+            <div class="control-label">
+              <span>批量导出</span>
+              <b id="batchCount">—</b>
+            </div>
+            <div class="segmented" role="radiogroup" aria-label="批量导出方式">
+              <label>
+                <input type="radio" name="batchMode" value="zip" checked />
+                <span>打包 ZIP</span>
+              </label>
+              <label>
+                <input type="radio" name="batchMode" value="each" />
+                <span>逐张下载</span>
+              </label>
+            </div>
+            <button class="btn-primary" id="exportAllBtn" type="button" disabled>导出全部</button>
+
+            <div class="progress hidden" id="exportProgress">
+              <div class="progress-bar"><i id="exportBar"></i></div>
+              <span class="mini-status" id="exportText">—</span>
+            </div>
+            <button class="btn-ghost hidden" id="exportCancelBtn" type="button">取消导出</button>
+          </div>
+
           <p class="hint">边框向外扩展，原图保持原始分辨率，不缩放、不压缩。</p>
+          <p class="hint" id="batchHint">批量导出会逐张按各自的 EXIF 生成成品；打包 ZIP 时文件名自动去重。</p>
         </div>
       </details>
 

@@ -80,6 +80,30 @@
   const qualityValEl   = $('qualityVal');
   const exportBtn      = $('exportBtn');
 
+  // 批量队列
+  const addBtn          = $('addBtn');
+  const prevBtn         = $('prevBtn');
+  const nextBtn         = $('nextBtn');
+  const batchPosEl      = $('batchPos');
+  const batchStrip      = $('batchStrip');
+  const clearBtn        = $('clearBtn');
+  const queueSummaryEl  = $('queueSummary');
+  const batchBadgeEl    = $('batchBadge');
+  const prepProgressEl  = $('prepProgress');
+  const prepBarEl       = $('prepBar');
+  const prepTextEl      = $('prepText');
+  const geocodeChk      = $('geocodeChk');
+  const geoProgressEl   = $('geoProgress');
+  const geoBarEl        = $('geoBar');
+  const geoTextEl       = $('geoText');
+  const batchCountEl    = $('batchCount');
+  const batchModeRadios = arr(document.querySelectorAll('input[name="batchMode"]'));
+  const exportAllBtn    = $('exportAllBtn');
+  const exportProgressEl = $('exportProgress');
+  const exportBarEl     = $('exportBar');
+  const exportTextEl    = $('exportText');
+  const exportCancelBtn = $('exportCancelBtn');
+
   /* ---------------- 常量 ---------------- */
   const PREVIEW_MAX    = 1600;    // 预览最大边长
   const MAX_CANVAS_DIM = 16384;   // 浏览器画布边长上限（保守值）
@@ -201,7 +225,8 @@
     logoKey: 'auto',      // auto（按品牌匹配）或具体 LOGO key
     logoScale: 1,         // LOGO 高度相对文字高度的比例
     format: 'png',
-    quality: 0.92
+    quality: 0.92,
+    batchMode: 'zip'      // 批量导出方式：zip（打包）/ each（逐张下载）
   };
 
   const fieldInputs = {};
@@ -744,6 +769,15 @@
     return name;
   }
 
+  // 地名反查结果回写到队列项，切换图片后不会丢失
+  function syncActiveGeoItem(failed) {
+    const item = activeItem();
+    if (!item) return;
+    item.values.location = state.meta.location;
+    item.geoSource = state.locationSource;
+    if (item.geoSource === 'auto') item.geoFailed = !!failed;
+  }
+
   async function queryPlaceName(force) {
     if (!state.gps) { setGeoStatus('无 GPS 信息', 'warn'); return; }
     if (state.hideLocation) { setGeoStatus('已隐藏位置', 'warn'); return; }
@@ -761,6 +795,7 @@
       state.locationSource = 'auto';
       geoInput.value = name;
       setGeoStatus('已获取地名', 'ok');
+      syncActiveGeoItem(false);
     } catch (e) {
       if (token !== state.geoToken) return;
       state.meta.location = coordText(lat, lon);
@@ -768,6 +803,7 @@
       geoInput.value = state.meta.location;
       setGeoStatus('反查失败，已显示坐标', 'warn');
       showNotice('地名反查失败（可能无网络或被限流），已改为显示经纬度；你也可以手动填写地点。', 'warn');
+      syncActiveGeoItem(true);
     }
     updatePreview();
   }
@@ -791,6 +827,7 @@
       input.spellcheck = false;
       input.addEventListener('input', function () {
         state.meta[def.key] = input.value;
+        markActiveEdited();                          // 手工填写优先，后台读取完成不再覆盖
         if (def.key === 'brand') syncLogoStatus();   // 品牌变化会改变 LOGO 的自动匹配
         updatePreview();
       });
@@ -1410,14 +1447,11 @@
 
     const fullW = state.img.naturalWidth;
     const fullH = state.img.naturalHeight;
-    const b = Math.round(state.borderWidth);
-    const be = Math.round(state.bottomExtra);
-    const cw = fullW + b * 2;
-    const ch = fullH + b * 2 + be;
 
-    if (cw > MAX_CANVAS_DIM || ch > MAX_CANVAS_DIM || cw * ch > MAX_CANVAS_PX) {
-      showNotice('成品尺寸 ' + cw + ' × ' + ch +
-        ' 超出浏览器画布上限，请减小边框宽度或底部文字区高度后重试。', 'warn');
+    try {
+      checkOutputSize(fullW, fullH);
+    } catch (e) {
+      showNotice(String((e && e.message) || e) + '，请减小边框宽度或底部文字区高度后重试。', 'warn');
       return;
     }
 
@@ -1426,8 +1460,8 @@
     exportBtn.textContent = '正在导出…';
 
     const done = function () {
-      exportBtn.disabled = false;
       exportBtn.textContent = oldLabel;
+      updateBatchUI();          // 恢复按钮可用状态
     };
 
     try {
@@ -1445,12 +1479,7 @@
           return;
         }
         const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = buildOutName(state.fileName, isJpeg ? 'jpg' : 'png');
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
+        triggerDownload(url, buildOutName(state.fileName, isJpeg ? 'jpg' : 'png'));
         setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
 
         showNotice('已导出 ' + canvas.width + ' × ' + canvas.height +
@@ -1463,78 +1492,568 @@
     }
   }
 
-  /* ---------------- 处理文件 ---------------- */
-  async function handleFile(file) {
-    if (!file) return;
+  /* ---------------- 批量队列 ---------------- */
+  // 一批照片共用右侧所有样式设置；每张只保留自己的拍摄信息与（按需解码的）大图。
+  // 状态：pending（待读取）/ prep（读取中）/ ready（就绪）/ done（本次已导出）/ error（读取失败）
+  const batch = {
+    items: [],
+    activeId: 0,
+    seq: 0,
+    rangesReady: false,   // 是否已按图片尺寸初始化过边框 / 文字区范围
+    prepToken: 0,
+    prepRunning: false,
+    lastAdd: 0,
+    exporting: false,
+    exportCancel: false,
+    geocoding: false,
+    geoToken: 0,
+    geoCancel: false
+  };
 
-    const name = String(file.name || '');
+  let exportCanvasEl = null;
+
+  function itemById(id) {
+    for (let i = 0; i < batch.items.length; i++) {
+      if (batch.items[i].id === id) return batch.items[i];
+    }
+    return null;
+  }
+
+  function activeItem() {
+    return itemById(batch.activeId) || batch.items[0] || null;
+  }
+
+  function activeIndex() {
+    const cur = activeItem();
+    return cur ? batch.items.indexOf(cur) : -1;
+  }
+
+  // 队列里的某张被用户手改过（避免后台读取完成时把手工输入覆盖掉）
+  function markActiveEdited() {
+    const item = activeItem();
+    if (item) item.userEdited = true;
+  }
+
+  function fileKindError(file) {
+    const name = String((file && file.name) || '');
     const lower = name.toLowerCase();
-
-    // HEIC 检测
-    if (/\.(heic|heif)$/.test(lower) || /image\/hei[cf]/i.test(file.type || '')) {
-      showNotice('HEIC / HEIF 格式暂不支持，请先转换为 JPG 或 PNG 后再试。', 'warn');
-      return;
+    if (/\.(heic|heif)$/.test(lower) || /image\/hei[cf]/i.test((file && file.type) || '')) {
+      return 'HEIC / HEIF 格式暂不支持，请先转换为 JPG 或 PNG 后再试。';
     }
-    if (!/^image\//i.test(file.type || '') &&
+    if (!/^image\//i.test((file && file.type) || '') &&
         !/\.(jpe?g|png|webp|bmp|gif|avif|tiff?)$/.test(lower)) {
-      showNotice('请选择图片文件（JPG / PNG 等）。', 'warn');
-      return;
+      return '请选择图片文件（JPG / PNG 等）。';
     }
+    return '';
+  }
 
-    clearNotice();
-    state.fileName = name || 'image';
+  function newItem(file) {
+    batch.seq++;
+    return {
+      id: batch.seq,
+      file: file,
+      name: String((file && file.name) || ('image' + batch.seq)),
+      status: 'pending',
+      values: {},          // 该张自己的拍摄信息（含 location 文案）
+      hasExif: false,
+      gps: null,
+      geoSource: 'none',   // none | auto | manual
+      geoFailed: false,
+      geoAsked: false,
+      img: null,           // 原始大图：只有当前预览的那张常驻内存
+      previewSource: null,
+      thumb: '',
+      error: '',
+      userEdited: false
+    };
+  }
 
-    let img;
+  /* ---------------- 进度显示 ---------------- */
+  function setProgress(barEl, textEl, wrapEl, done, total, name) {
+    if (wrapEl) wrapEl.classList.remove('hidden');
+    if (barEl) barEl.style.width = (total > 0 ? Math.round(done / total * 100) : 0) + '%';
+    if (textEl) textEl.textContent = done + ' / ' + total + (name ? ' · ' + name : '');
+  }
+
+  function hideProgress(barEl, wrapEl) {
+    if (wrapEl) wrapEl.classList.add('hidden');
+    if (barEl) barEl.style.width = '0%';
+  }
+
+  function nextTick() {
+    return new Promise(function (r) { setTimeout(r, 0); });
+  }
+
+  function syncPrepProgress() {
+    const total = batch.items.length;
+    let done = 0;
+    let cur = null;
+    batch.items.forEach(function (x) {
+      if (x.status === 'prep') cur = x;
+      else if (x.status !== 'pending') done++;
+    });
+    if (total - done > 0) setProgress(prepBarEl, prepTextEl, prepProgressEl, done, total, cur ? cur.name : '');
+    else hideProgress(prepBarEl, prepProgressEl);
+  }
+
+  /* ---------------- 缩略图 ---------------- */
+  // 优先让浏览器在解码阶段就缩小（不必解码整幅大图，内存占用与照片大小无关）
+  async function makeThumb(file) {
+    const MAX = 128;
     try {
-      img = await loadImage(file);
-    } catch (err) {
-      showNotice('无法读取该图片，格式可能不受支持。', 'warn');
+      if (typeof createImageBitmap === 'function') {
+        let bmp = null;
+        try {
+          bmp = await createImageBitmap(file, { resizeWidth: MAX, resizeQuality: 'medium' });
+        } catch (e) {
+          bmp = await createImageBitmap(file);
+        }
+        const c = document.createElement('canvas');
+        const sc = Math.min(1, MAX / Math.max(bmp.width, bmp.height));
+        c.width = Math.max(1, Math.round(bmp.width * sc));
+        c.height = Math.max(1, Math.round(bmp.height * sc));
+        c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+        if (typeof bmp.close === 'function') bmp.close();
+        return c.toDataURL('image/jpeg', 0.72);
+      }
+    } catch (e) { /* 退回 <img> 解码 */ }
+
+    try {
+      const img = await loadImage(file);
+      const c = document.createElement('canvas');
+      const sc = Math.min(1, MAX / Math.max(img.naturalWidth, img.naturalHeight));
+      c.width = Math.max(1, Math.round(img.naturalWidth * sc));
+      c.height = Math.max(1, Math.round(img.naturalHeight * sc));
+      c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+      return c.toDataURL('image/jpeg', 0.72);
+    } catch (e) {
+      return '';
+    }
+  }
+
+  /* ---------------- 后台读取（EXIF + 缩略图） ---------------- */
+  async function prepareItem(item) {
+    const parsed = await parseExif(item.file);
+    item.values = parsed.values || {};
+    item.hasExif = !!parsed.hasExif;
+    item.gps = parsed.gps || null;
+    item.geoFailed = false;
+    if (item.gps) {
+      item.values.location = coordText(item.gps.latitude, item.gps.longitude);   // 先落坐标兜底
+      item.geoSource = 'auto';
+    }
+    item.thumb = await makeThumb(item.file);
+    if (!item.thumb && !item.img) item.img = await loadImage(item.file);   // 缩略图失败也要确认能解码
+  }
+
+  // 顺序读取整队列：每张之间让出主线程，界面保持可用
+  async function startPrep() {
+    if (batch.prepRunning) return;
+    batch.prepRunning = true;
+    const token = batch.prepToken;
+    updateBatchUI();
+
+    for (;;) {
+      if (token !== batch.prepToken) break;             // 队列已被清空 / 重建
+      let item = null;
+      for (let i = 0; i < batch.items.length; i++) {
+        if (batch.items[i].status === 'pending') { item = batch.items[i]; break; }
+      }
+      if (!item) break;
+
+      item.status = 'prep';
+      updateBatchUI();
+      try {
+        await prepareItem(item);
+        item.status = 'ready';
+      } catch (e) {
+        item.status = 'error';
+        item.error = '无法解码该图片';
+      }
+      applyPreparedToState(item);
+      updateBatchUI();
+      await nextTick();
+    }
+
+    batch.prepRunning = false;
+    syncPrepProgress();
+    updateBatchUI();
+    finishPrepNotice();
+  }
+
+  // 后台读取完成后，若这张正是当前预览的图，就把结果同步到界面（用户手改过则不覆盖）
+  function applyPreparedToState(item) {
+    if (!item || item !== activeItem() || item.userEdited) return;
+    state.meta = item.values;
+    state.gps = item.gps;
+    state.hasExif = item.hasExif;
+    state.locationSource = item.geoSource;
+    setMeta(item.values);
+    setExifBadge(item.hasExif);
+    syncGeoStatus(item);
+    geoInput.value = state.hideLocation ? '' : cleanStr(item.values.location);
+    updatePreview();
+    maybeQueryPlaceName(item);
+    showExifNotice(item);
+  }
+
+  function syncGeoStatus(item) {
+    if (state.hideLocation) { setGeoStatus('已隐藏位置', 'warn'); return; }
+    const loc = cleanStr(item && item.values ? item.values.location : '');
+    if (!item || !item.gps) { setGeoStatus(loc ? '手动填写' : '无 GPS 信息'); return; }
+    if (item.geoSource === 'manual') { setGeoStatus('手动填写'); return; }
+    if (item.geoFailed) { setGeoStatus('反查失败，已显示坐标', 'warn'); return; }
+    if (loc && loc !== coordText(item.gps.latitude, item.gps.longitude)) setGeoStatus('已获取地名', 'ok');
+    else setGeoStatus('未获取');
+  }
+
+  // 只有单张时保持原有体验：读到 GPS 就自动反查地名；批量交给「批量反查」开关
+  function maybeQueryPlaceName(item) {
+    if (!item || item !== activeItem()) return;
+    if (!item.gps || state.hideLocation) return;
+    if (batch.items.length > 1) return;
+    if (item.geoSource === 'manual' || item.geoAsked) return;
+    item.geoAsked = true;
+    queryPlaceName(false);
+  }
+
+  function showExifNotice(item) {
+    if (!item || item !== activeItem()) return;
+    if (item.status === 'pending' || item.status === 'prep') return;   // 等读取完成再提示
+    const libOk = !!(window.exifr && typeof window.exifr.parse === 'function');
+    if (!libOk) {
+      showNotice('EXIF 解析库未加载（请检查网络连接），请在右侧手动填写拍摄信息。', 'warn');
       return;
     }
+    if (item.hasExif) return;
+    if (batch.items.length === 1) showNotice('未检测到拍摄信息，请在右侧手动填写相关字段。', 'info');
+    else showNotice('「' + item.name + '」未检测到拍摄信息，可手动填写，或改用其他图片。', 'info');
+  }
 
-    state.img = img;
+  function finishPrepNotice() {
+    if (batch.lastAdd > 1) {
+      const total = batch.items.length;
+      const noExif = batch.items.filter(function (x) { return !x.hasExif; }).length;
+      showNotice('已添加 ' + total + ' 张图片' +
+        (noExif ? '（其中 ' + noExif + ' 张没有 EXIF 信息，可逐张手动填写）' : '') +
+        '，可点缩略图逐张检查，或直接「导出全部」。', 'ok');
+    }
+    batch.lastAdd = 0;
+  }
 
-    const libOk = !!(window.exifr && typeof window.exifr.parse === 'function');
-    const parsed = libOk
-      ? await parseExif(file)
-      : { values: {}, hasExif: false, gps: null };
+  /* ---------------- 切换 / 移除队列项 ---------------- */
+  // 只保留当前图片的原始数据，其余释放（再次切回时重新解码）
+  function releaseOtherImages(keep) {
+    batch.items.forEach(function (x) { if (x !== keep && x.img) x.img = null; });
+  }
 
-    setMeta(parsed.values);
-    state.hasExif = parsed.hasExif;
-    state.gps = parsed.gps;
-    state.locationSource = 'none';
-    state.geoToken++;               // 作废上一张图未完成的反查请求
-    setExifBadge(parsed.hasExif);
+  // 激活序号：解码是异步的，连点缩略图 / 连续删除时只让最后一次生效
+  let activateSeq = 0;
 
-    // 位置：先落坐标为兜底值，再异步反查地名
-    if (state.gps && !state.hideLocation) {
-      state.meta.location = coordText(state.gps.latitude, state.gps.longitude);
-      state.locationSource = 'auto';
-      geoInput.value = state.meta.location;
-      queryPlaceName(false);
-    } else {
-      state.meta.location = '';
-      geoInput.value = '';
-      if (state.hideLocation) setGeoStatus('已隐藏位置', 'warn');
-      else setGeoStatus(state.gps ? '未获取' : '无 GPS 信息');
+  async function activateItem(id, opts) {
+    const item = itemById(id);
+    if (!item) return;
+
+    // 连点缩略图 / 连续删除时，只有最后一次激活生效（解码是异步的）
+    const token = ++activateSeq;
+    const prev = activeItem();          // 新图读不出来时退回这张
+
+    batch.activeId = item.id;
+    renderStrip();
+    updateBatchUI();
+
+    if (!item.img) {
+      try {
+        item.img = await loadImage(item.file);
+      } catch (e) {
+        if (token !== activateSeq) return;
+        item.status = 'error';
+        item.error = '无法解码该图片';
+        // 读不出来就留在原来那张，保证「显示的照片 / 高亮项 / 导出对象」一致
+        if (prev && itemById(prev.id)) batch.activeId = prev.id;
+        showNotice('「' + item.name + '」无法读取，格式可能不受支持。', 'warn');
+        updateBatchUI();
+        return;
+      }
+      if (token !== activateSeq || !itemById(item.id)) return;   // 期间又切了别的图 / 该项已被移除
+      item.previewSource = item.previewSource || makePreviewSource(item.img);
     }
 
-    setupRangesForImage(img.naturalWidth, img.naturalHeight);
-    state.previewSource = makePreviewSource(img);
+    // 新图就绪后再释放其他大图（包括上一张）：内存里只留当前这张
+    releaseOtherImages(item);
+
+    // 当前这张的信息（队列里每张各自一份）
+    state.img = item.img;
+    state.previewSource = item.previewSource;
+    state.fileName = item.name;
+    state.meta = item.values;
+    state.gps = item.gps;
+    state.hasExif = item.hasExif;
+    state.locationSource = item.geoSource;
+    state.geoToken++;               // 作废上一张未完成的地名反查
+
+    // 队列首次载入（或替换当前图）时按图片尺寸重算范围，其余时候保持同一套样式
+    if (!batch.rangesReady || (opts && opts.resetRanges)) {
+      batch.rangesReady = true;
+      setupRangesForImage(item.img.naturalWidth, item.img.naturalHeight);
+    }
 
     dropzone.classList.add('hidden');
     viewer.classList.remove('hidden');
-    fileNameEl.textContent = state.fileName;
-    fileNameEl.title = state.fileName;
-    exportBtn.disabled = false;
-
+    fileNameEl.textContent = item.name +
+      (batch.items.length > 1 ? ' · 第 ' + (activeIndex() + 1) + ' 张' : '');
+    fileNameEl.title = item.name;
+    setMeta(item.values);
+    setExifBadge(item.hasExif);
+    const reading = item.status === 'pending' || item.status === 'prep';
+    if (reading) setGeoStatus('正在读取拍摄信息…', 'busy');
+    else syncGeoStatus(item);
+    geoInput.value = state.hideLocation ? '' : cleanStr(item.values.location);
+    geoInput.disabled = state.hideLocation;
+    geoRetry.disabled = state.hideLocation;
+    syncSizeControl();
+    syncLogoSizeLabel();
+    syncPosControl();
     updatePreview();
+    renderStrip();
+    updateBatchUI();
+    maybeQueryPlaceName(item);
+    showExifNotice(item);
+  }
 
-    if (!libOk) {
-      showNotice('EXIF 解析库未加载（请检查网络连接），请在右侧手动填写拍摄信息。', 'warn');
-    } else if (!parsed.hasExif) {
-      showNotice('未检测到拍摄信息，请在右侧手动填写相关字段。', 'info');
+  function stepItem(dir) {
+    const n = batch.items.length;
+    if (n < 2 || batch.exporting) return;
+    const i = activeIndex();
+    if (i < 0) return;
+    activateItem(batch.items[(i + dir + n) % n].id);
+  }
+
+  /* ---------------- 缩略图条 / 队列状态 ---------------- */
+  function renderStrip() {
+    if (!batchStrip) return;
+    const many = batch.items.length > 1;
+    batchStrip.classList.toggle('hidden', !many);
+    if (!many) {
+      batchStrip.innerHTML = '';
+      return;
     }
+
+    const old = {};
+    arr(batchStrip.children).forEach(function (el) { if (el.dataset.id) old[el.dataset.id] = el; });
+    const sameSet = Object.keys(old).length === batch.items.length &&
+      batch.items.every(function (x) { return !!old[String(x.id)]; });
+    if (!sameSet) batchStrip.innerHTML = '';
+
+    batch.items.forEach(function (item, i) {
+      let tile = sameSet ? old[String(item.id)] : null;
+      if (!tile) {
+        tile = document.createElement('div');
+        tile.dataset.id = String(item.id);
+        tile.addEventListener('click', function () { activateItem(item.id); });
+
+        const ph = document.createElement('span');
+        ph.className = 'idx';
+        ph.textContent = String(i + 1);
+        tile.appendChild(ph);
+
+        const dot = document.createElement('span');
+        dot.className = 'dot';
+        tile.appendChild(dot);
+
+        const x = document.createElement('button');
+        x.type = 'button';
+        x.className = 'x';
+        x.textContent = '×';
+        x.title = '从队列移除';
+        x.addEventListener('click', function (e) {
+          e.stopPropagation();
+          removeItem(item.id);
+        });
+        tile.appendChild(x);
+
+        batchStrip.appendChild(tile);
+      }
+
+      tile.className = 'thumb ' + item.status + (item.id === batch.activeId ? ' on' : '');
+      tile.title = item.name +
+        (item.status === 'pending' || item.status === 'prep' ? '（读取中）' : '') +
+        (item.error ? '（' + item.error + '）' : '');
+      tile.dataset.status = item.status;
+
+      const img = tile.querySelector('img');
+      if (item.thumb) {
+        if (!img) {
+          const el = document.createElement('img');
+          el.src = item.thumb;
+          el.alt = '';
+          tile.insertBefore(el, tile.firstChild);
+          const ph = tile.querySelector('.idx');
+          if (ph) ph.remove();
+        } else if (img.getAttribute('src') !== item.thumb) {
+          img.src = item.thumb;
+        }
+      }
+    });
+
+    if (!sameSet) {
+      const on = batchStrip.querySelector('.thumb.on');
+      if (on && on.scrollIntoView) on.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+  }
+
+  function updateBatchUI() {
+    const total = batch.items.length;
+    let ready = 0;
+    let failed = 0;
+    let pending = 0;
+    let exported = 0;
+    batch.items.forEach(function (x) {
+      if (x.status === 'error') failed++;
+      else if (x.status === 'done') exported++;
+      else if (x.status === 'pending' || x.status === 'prep') pending++;
+      else ready++;
+    });
+
+    const idx = activeIndex();
+    batchPosEl.textContent = total ? (idx + 1) + ' / ' + total : '0 / 0';
+    prevBtn.disabled = nextBtn.disabled = total < 2 || batch.exporting;
+
+    batchCountEl.textContent = total ? total + ' 张' : '—';
+    queueSummaryEl.textContent = total
+      ? '共 ' + total + ' 张 · 就绪 ' + ready + (exported ? ' · 已导出 ' + exported : '') +
+        (failed ? ' · 失败 ' + failed : '') + (pending ? ' · 读取中 ' + pending : '')
+      : '尚未添加图片';
+    queueSummaryEl.className = 'mini-status' +
+      (pending ? ' busy' : (failed ? ' warn' : (total ? ' ok' : '')));
+
+    clearBtn.disabled = !total || batch.exporting;
+    exportAllBtn.disabled = total < 2 || batch.exporting || pending > 0;
+    exportAllBtn.textContent = batch.exporting
+      ? '正在导出…'
+      : (total > 1 ? '导出全部（' + total + ' 张）' : '导出全部');
+    exportBtn.disabled = !total || !state.img || batch.exporting;
+    exportCancelBtn.classList.toggle('hidden', !batch.exporting);
+
+    batchBadgeEl.classList.toggle('hidden', !total);
+    if (total) {
+      batchBadgeEl.textContent = pending ? '读取中 ' + (total - pending) + '/' + total
+        : '就绪 ' + (total - failed) + '/' + total;
+      batchBadgeEl.className = 'badge ' + (failed ? 'badge-warn' : 'badge-ok');
+    }
+
+    syncPrepProgress();
+    renderStrip();
+  }
+
+  function removeItem(id) {
+    const i = batch.items.indexOf(itemById(id));
+    if (i < 0) return;
+    const item = batch.items[i];
+    if (item !== activeItem() && item.img) item.img = null;
+    batch.items.splice(i, 1);
+
+    if (!batch.items.length) { resetQueue(); return; }
+
+    if (item.id === batch.activeId) {
+      const next = batch.items[Math.min(i, batch.items.length - 1)];
+      batch.activeId = next.id;
+      activateItem(next.id);
+    }
+    updateBatchUI();
+  }
+
+  // 清空队列 → 回到「拖入照片」的初始状态
+  function resetQueue() {
+    batch.items.forEach(function (x) { x.img = null; x.previewSource = null; });
+    batch.items = [];
+    batch.activeId = 0;
+    batch.rangesReady = false;
+    batch.prepToken++;              // 作废未完成的读取流程
+    batch.geoToken++;
+    batch.geoCancel = true;
+    batch.geocoding = false;
+    batch.lastAdd = 0;
+
+    state.img = null;
+    state.previewSource = null;
+    state.fileName = '';
+    state.meta = {};
+    state.gps = null;
+    state.hasExif = false;
+    state.locationSource = 'none';
+
+    dropzone.classList.remove('hidden');
+    viewer.classList.add('hidden');
+    fileNameEl.textContent = '';
+    geoInput.value = '';
+    geoInput.disabled = false;
+    geoRetry.disabled = false;
+    setExifBadge(false);
+    setGeoStatus('未获取');
+    hideProgress(prepBarEl, prepProgressEl);
+    hideProgress(geoBarEl, geoProgressEl);
+    hideProgress(exportBarEl, exportProgressEl);
+    geocodeChk.checked = false;
+    syncSizeControl();              // 会禁用字号滑块并复位「垂直位置」
+    updateBatchUI();
+    clearNotice();
+  }
+
+  /* ---------------- 处理文件 ---------------- */
+  // 追加到队列（返回新加入的项）
+  function addFiles(list) {
+    const files = arr(list).filter(Boolean);
+    const added = [];
+    const skipped = [];
+
+    files.forEach(function (file) {
+      const err = fileKindError(file);
+      if (err) { skipped.push(String((file && file.name) || '未命名')); return; }
+      const item = newItem(file);
+      batch.items.push(item);
+      added.push(item);
+    });
+
+    if (skipped.length) {
+      showNotice('已跳过 ' + skipped.length + ' 个不支持的文件：' +
+        skipped.slice(0, 3).join('、') + (skipped.length > 3 ? ' 等' : '') + '。', 'warn');
+    }
+    if (!added.length) return [];
+
+    batch.lastAdd = added.length;
+    startPrep();
+    return added;
+  }
+
+  // 更换当前项：只替换这一个文件，位置不变，其余队列项不受影响
+  function replaceActiveFile(file) {
+    const err = fileKindError(file);
+    if (err) { showNotice(err, 'warn'); return; }
+
+    const cur = activeItem();
+    const at = cur ? batch.items.indexOf(cur) : batch.items.length;
+    if (cur) batch.items.splice(at, 1);
+
+    const item = newItem(file);
+    batch.items.splice(at, 0, item);
+    batch.activeId = item.id;
+    if (batch.items.length <= 1) batch.rangesReady = false;   // 单张时换图按新尺寸重算范围（与旧版一致）
+    batch.lastAdd = 1;
+    startPrep();
+    activateItem(item.id);
+  }
+
+  // 统一入口：mode = 'replace'（更换当前）| 'add'（追加）
+  async function handleFiles(list, mode) {
+    const files = arr(list).filter(Boolean);
+    if (!files.length) return;
+
+    if (mode === 'replace' && batch.items.length) { replaceActiveFile(files[0]); return; }
+
+    const added = addFiles(files);
+    if (!added.length) return;
+    await activateItem(added[0].id);
   }
 
   /* ---------------- 拖拽 ---------------- */
@@ -1556,9 +2075,498 @@
       e.preventDefault();
       e.stopPropagation();
       previewPane.classList.remove('drag');
-      const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
-      if (f) handleFile(f);
+      const files = (e.dataTransfer && e.dataTransfer.files) || null;
+      if (files && files.length) handleFiles(files, batch.items.length ? 'add' : 'replace');
     });
+  }
+
+  /* ---------------- 导出：公共小工具 ---------------- */
+  function canvasToBlob(canvas, type, quality) {
+    return new Promise(function (resolve, reject) {
+      canvas.toBlob(function (blob) {
+        if (blob) resolve(blob);
+        else reject(new Error('无法生成图片数据'));
+      }, type, quality);
+    });
+  }
+
+  function triggerDownload(url, name) {
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
+  function exportCanvas() {
+    if (!exportCanvasEl) exportCanvasEl = document.createElement('canvas');
+    return exportCanvasEl;
+  }
+
+  // 临时切到「这一张」的数据做同步合成；合成一结束立即还原，不影响当前预览
+  function withItem(item, fn) {
+    const saved = {
+      img: state.img, previewSource: state.previewSource, fileName: state.fileName,
+      meta: state.meta, gps: state.gps, hasExif: state.hasExif,
+      locationSource: state.locationSource
+    };
+    state.img = item.img;
+    state.previewSource = item.previewSource;
+    state.fileName = item.name;
+    state.meta = item.values;
+    state.gps = item.gps;
+    state.hasExif = item.hasExif;
+    state.locationSource = item.geoSource;
+    try {
+      return fn();
+    } finally {
+      state.img = saved.img;
+      state.previewSource = saved.previewSource;
+      state.fileName = saved.fileName;
+      state.meta = saved.meta;
+      state.gps = saved.gps;
+      state.hasExif = saved.hasExif;
+      state.locationSource = saved.locationSource;
+    }
+  }
+
+  // 成品尺寸；超出浏览器画布上限时提前抛错（不必等画布分配失败）
+  function checkOutputSize(w, h) {
+    const b = Math.round(state.borderWidth);
+    const be = Math.round(state.bottomExtra);
+    const cw = w + b * 2;
+    const ch = h + b * 2 + be;
+    if (cw > MAX_CANVAS_DIM || ch > MAX_CANVAS_DIM || cw * ch > MAX_CANVAS_PX) {
+      throw new Error('成品 ' + cw + ' × ' + ch + ' 超出浏览器画布上限');
+    }
+    return { w: cw, h: ch };
+  }
+
+  async function renderItemBlob(item, type, quality) {
+    if (!item.img) {
+      item.img = await loadImage(item.file);
+      item.previewSource = item.previewSource || makePreviewSource(item.img);
+    }
+    const img = item.img;
+    const fullW = img.naturalWidth;
+    const fullH = img.naturalHeight;
+    checkOutputSize(fullW, fullH);
+    const canvas = withItem(item, function () {
+      return compose(img, 1, fullW, fullH, exportCanvas());
+    });
+    return await canvasToBlob(canvas, type, quality);
+  }
+
+  // 同名照片自动加序号，避免打包时相互覆盖
+  function uniqueName(used, name, ext) {
+    const base = buildOutName(name, ext);
+    if (!used[base]) { used[base] = 1; return base; }
+    const m = /^(.*?)(\.[^.]+)$/.exec(base);
+    const stem = m ? m[1] : base;
+    const tail = m ? m[2] : '';
+    let n = used[base];
+    let cand = '';
+    do {
+      n++;
+      cand = stem + '-' + n + tail;
+    } while (used[cand]);
+    used[base] = n;
+    used[cand] = 1;
+    return cand;
+  }
+
+  function batchZipName() {
+    const d = new Date();
+    const p = function (n) { return String(n).padStart(2, '0'); };
+    return 'framed_' + d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) +
+      '_' + p(d.getHours()) + p(d.getMinutes()) + '.zip';
+  }
+
+  function stopExport(msg, kind) {
+    batch.exporting = false;
+    batch.exportCancel = false;
+    hideProgress(exportBarEl, exportProgressEl);
+    updateBatchUI();
+    if (msg) showNotice(msg, kind || 'info');
+  }
+
+  /* ---------------- 批量导出 ---------------- */
+  async function doExportAll() {
+    if (batch.exporting) return;
+
+    const items = batch.items.filter(function (x) { return x.status === 'ready' || x.status === 'done'; });
+    if (!items.length) {
+      showNotice('队列里还没有可以导出的图片。', 'info');
+      return;
+    }
+    if (items.length === 1) { doExport(); return; }      // 只有一张就按单张导出
+
+    const zipMode = state.batchMode === 'zip';
+    const isJpeg = state.format === 'jpeg';
+    const ext = isJpeg ? 'jpg' : 'png';
+    const type = isJpeg ? 'image/jpeg' : 'image/png';
+    const quality = isJpeg ? state.quality : undefined;
+
+    batch.exporting = true;
+    batch.exportCancel = false;
+    updateBatchUI();
+    setProgress(exportBarEl, exportTextEl, exportProgressEl, 0, items.length, '');
+
+    const used = Object.create(null);
+    const rows = [];          // 内存打包：{ name, blob }
+    const failed = [];
+    const done = [];          // 本次已写出的项
+
+    // 打包模式优先「另存为」流式写盘：整包不占内存
+    let sink = null;
+    let zip = null;
+    if (zipMode) {
+      const picked = await pickZipSink(batchZipName());
+      if (picked === 'abort') {
+        stopExport('已取消批量导出（没有生成文件）。', 'info');
+        return;
+      }
+      if (picked) {
+        sink = picked;
+        zip = makeZipWriter(sink);
+      }
+    }
+
+    try {
+      for (let i = 0; i < items.length; i++) {
+        if (batch.exportCancel) break;
+        const item = items[i];
+        setProgress(exportBarEl, exportTextEl, exportProgressEl, i, items.length, item.name);
+        await nextTick();
+
+        try {
+          const blob = await renderItemBlob(item, type, quality);
+          const name = uniqueName(used, item.name, ext);
+          if (zipMode) {
+            if (zip) await zip.add(name, blob);
+            else rows.push({ name: name, blob: blob });
+          } else {
+            const url = URL.createObjectURL(blob);
+            triggerDownload(url, name);
+            setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+          }
+          item.status = 'done';
+          item.error = '';
+          done.push(item);
+          releaseOtherImages(activeItem());      // 只留当前预览那张的大图
+        } catch (e) {
+          item.error = '导出失败：' + String((e && e.message) || e);
+          failed.push(item.name);
+        }
+        setProgress(exportBarEl, exportTextEl, exportProgressEl, done.length, items.length, item.name);
+        updateBatchUI();
+      }
+
+      const cancelled = batch.exportCancel;
+      if (zipMode) {
+        if (cancelled) {
+          if (sink) await sink.abort();
+          done.forEach(function (x) { x.status = 'ready'; });   // 压缩包被丢弃，状态回退
+        } else if (sink) {
+          await zip.finish();
+          await sink.close();
+        } else {
+          const blob = await buildZipBlob(rows);
+          const url = URL.createObjectURL(blob);
+          triggerDownload(url, batchZipName());
+          setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+        }
+      }
+
+      if (cancelled) {
+        showNotice('已取消批量导出' +
+          (zipMode ? '（没有生成文件）' : '（已下载 ' + done.length + ' 张）') + '。', 'info');
+      } else if (failed.length) {
+        showNotice('已导出 ' + done.length + '/' + items.length + ' 张' +
+          (zipMode ? '（打包 ZIP）' : '（逐张下载）') + '，' + failed.length + ' 张失败：' +
+          failed.slice(0, 3).join('、') + (failed.length > 3 ? ' 等' : '') + '。', 'warn');
+      } else {
+        showNotice('已导出全部 ' + done.length + ' 张' +
+          (zipMode ? '，已打包为 ZIP' : '（逐张下载）') + '。', 'ok');
+      }
+    } catch (e) {
+      if (sink) await sink.abort();
+      showNotice('批量导出失败：' + String((e && e.message) || e) + '。', 'warn');
+    } finally {
+      batch.exporting = false;
+      batch.exportCancel = false;
+      hideProgress(exportBarEl, exportProgressEl);
+      updateBatchUI();
+    }
+  }
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  /* ---------------- 批量地名反查（顺序 + 限速） ---------------- */
+  async function startGeocodeQueue() {
+    if (batch.geocoding) return;
+
+    const targets = batch.items.filter(function (x) { return !!x.gps && x.geoSource !== 'manual'; });
+    if (!targets.length) {
+      geocodeChk.checked = false;
+      showNotice('队列里没有带 GPS 的照片，无需反查地名。', 'info');
+      return;
+    }
+
+    batch.geocoding = true;
+    batch.geoCancel = false;
+    const token = ++batch.geoToken;
+    let done = 0;
+
+    for (let i = 0; i < targets.length; i++) {
+      if (batch.geoCancel || token !== batch.geoToken) break;
+      const item = targets[i];
+      setProgress(geoBarEl, geoTextEl, geoProgressEl, i, targets.length, item.name);
+
+      const key = item.gps.latitude.toFixed(4) + ',' + item.gps.longitude.toFixed(4);
+      const cached = !!geoCache[key];
+      try {
+        const name = await reverseGeocode(item.gps.latitude, item.gps.longitude);
+        item.values.location = name;
+        item.geoFailed = false;
+      } catch (e) {
+        item.geoFailed = true;
+        item.values.location = coordText(item.gps.latitude, item.gps.longitude);
+      }
+      item.geoSource = 'auto';
+      done++;
+      setProgress(geoBarEl, geoTextEl, geoProgressEl, done, targets.length, item.name);
+
+      // 当前预览的正好是这张 → 同步界面
+      if (item === activeItem()) {
+        state.meta.location = item.values.location;
+        state.locationSource = 'auto';
+        geoInput.value = item.values.location;
+        syncGeoStatus(item);
+        updatePreview();
+      }
+
+      // 命中缓存无需等待；真实请求之间间隔 1.1s，遵守 Nominatim 使用条款
+      if (i < targets.length - 1 && !cached) await sleep(1100);
+    }
+
+    batch.geocoding = false;
+    hideProgress(geoBarEl, geoProgressEl);
+    geocodeChk.checked = false;
+    if (batch.geoCancel) showNotice('已停止批量反查地名（前 ' + done + ' 张已更新）。', 'info');
+    else showNotice('批量地名反查完成（' + done + '/' + targets.length + ' 张）。', 'ok');
+    batch.geoCancel = false;
+  }
+
+  /* ---------------- ZIP 打包（store 存储模式，零依赖、可离线） ---------------- */
+  // JPEG / PNG 本身已压缩，直接存储即可；记录里带 ZIP64 扩展，整包超过 4GB 也能正常打开。
+  const CRC_TABLE = (function () {
+    const t = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+      t[n] = c >>> 0;
+    }
+    return t;
+  }());
+
+  function crc32(bytes, seed) {
+    let c = (seed === undefined ? 0xFFFFFFFF : seed) >>> 0;
+    for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+    return c >>> 0;
+  }
+
+  // 分块读取 Blob 求校验和与长度：内存占用与文件大小无关
+  async function blobCrc(blob) {
+    let c = 0xFFFFFFFF;
+    let size = 0;
+    if (blob.stream && typeof blob.stream === 'function') {
+      const reader = blob.stream().getReader();
+      for (;;) {
+        const step = await reader.read();
+        if (step.done) break;
+        c = crc32(step.value, c);
+        size += step.value.length;
+      }
+    } else {
+      const buf = new Uint8Array(await blob.arrayBuffer());
+      c = crc32(buf, c);
+      size = buf.length;
+    }
+    return { crc: (c ^ 0xFFFFFFFF) >>> 0, size: size };
+  }
+
+  const ZIP32_MAX = 0xFFFFFFFF;
+
+  function zipCat(list) {
+    let n = 0;
+    for (let i = 0; i < list.length; i++) n += list[i].length;
+    const out = new Uint8Array(n);
+    let o = 0;
+    for (let i = 0; i < list.length; i++) { out.set(list[i], o); o += list[i].length; }
+    return out;
+  }
+
+  function zipU16(v) { const a = new Uint8Array(2); new DataView(a.buffer).setUint16(0, v & 0xFFFF, true); return a; }
+  function zipU32(v) { const a = new Uint8Array(4); new DataView(a.buffer).setUint32(0, v >>> 0, true); return a; }
+  function zipU64(v) {
+    const a = new Uint8Array(8);
+    const dv = new DataView(a.buffer);
+    const n = Math.max(0, Math.floor(v));
+    if (typeof dv.setBigUint64 === 'function') dv.setBigUint64(0, BigInt(n), true);
+    else { dv.setUint32(0, n >>> 0, true); dv.setUint32(4, Math.floor(n / 4294967296) >>> 0, true); }
+    return a;
+  }
+
+  // MS-DOS 日期时间（ZIP 头使用）
+  function dosStamp(d) {
+    const date = ((((d.getFullYear() - 1980) & 0x7F) << 9) |
+      (((d.getMonth() + 1) & 0x0F) << 5) | (d.getDate() & 0x1F)) & 0xFFFF;
+    const time = (((d.getHours() & 0x1F) << 11) |
+      ((d.getMinutes() & 0x3F) << 5) | ((d.getSeconds() >> 1) & 0x1F)) & 0xFFFF;
+    return { time: time, date: date };
+  }
+
+  function zipUtf8(str) { return new TextEncoder().encode(str); }
+
+  function zipLocalHeader(e, st) {
+    const big = e.size >= ZIP32_MAX;
+    const name = zipUtf8(e.name);
+    const extra = big ? zipCat([zipU16(0x0001), zipU16(16), zipU64(e.size), zipU64(e.size)]) : new Uint8Array(0);
+    return zipCat([
+      zipU32(0x04034b50), zipU16(big ? 45 : 20), zipU16(0x0800), zipU16(0),   // 0x0800：文件名为 UTF-8
+      zipU16(st.time), zipU16(st.date), zipU32(e.crc),
+      zipU32(big ? ZIP32_MAX : e.size), zipU32(big ? ZIP32_MAX : e.size),
+      zipU16(name.length), zipU16(extra.length), name, extra
+    ]);
+  }
+
+  function zipCentralRecord(e, st) {
+    const bigSize = e.size >= ZIP32_MAX;
+    const bigOff = e.offset >= ZIP32_MAX;
+    const name = zipUtf8(e.name);
+    const body = [];
+    if (bigSize) body.push(zipU64(e.size), zipU64(e.size));
+    if (bigOff) body.push(zipU64(e.offset));
+    let extra = new Uint8Array(0);
+    if (body.length) {
+      let n = 0;
+      for (let i = 0; i < body.length; i++) n += body[i].length;
+      extra = zipCat([zipU16(0x0001), zipU16(n)].concat(body));
+    }
+    return zipCat([
+      zipU32(0x02014b50), zipU16(20), zipU16((bigSize || bigOff) ? 45 : 20), zipU16(0x0800), zipU16(0),
+      zipU16(st.time), zipU16(st.date), zipU32(e.crc),
+      zipU32(bigSize ? ZIP32_MAX : e.size), zipU32(bigSize ? ZIP32_MAX : e.size),
+      zipU16(name.length), zipU16(extra.length), zipU16(0), zipU16(0), zipU16(0), zipU32(0),
+      zipU32(bigOff ? ZIP32_MAX : e.offset), name, extra
+    ]);
+  }
+
+  function zipEndRecords(count, cdSize, cdOffset) {
+    const need64 = count > 0xFFFF || cdSize >= ZIP32_MAX || cdOffset >= ZIP32_MAX;
+    const out = [];
+    if (need64) {
+      out.push(zipCat([
+        zipU32(0x06064b50), zipU64(44), zipU16(45), zipU16(45), zipU32(0), zipU32(0),
+        zipU64(count), zipU64(count), zipU64(cdSize), zipU64(cdOffset)
+      ]));
+      out.push(zipCat([zipU32(0x07064b50), zipU32(0), zipU64(cdOffset + cdSize), zipU32(1)]));
+    }
+    out.push(zipCat([
+      zipU32(0x06054b50), zipU16(0), zipU16(0),
+      zipU16(Math.min(count, 0xFFFF)), zipU16(Math.min(count, 0xFFFF)),
+      zipU32(Math.min(cdSize, ZIP32_MAX)), zipU32(Math.min(cdOffset, ZIP32_MAX)), zipU16(0)
+    ]));
+    return out;
+  }
+
+  // sink.write(part)：part 可以是 Uint8Array、Uint8Array[] 或 Blob
+  function makeZipWriter(sink) {
+    const dir = [];
+    const st = dosStamp(new Date());
+    let offset = 0;
+    return {
+      count: 0,
+      async add(name, blob) {
+        const info = await blobCrc(blob);
+        const e = { name: name, crc: info.crc, size: info.size, offset: offset };
+        const head = zipLocalHeader(e, st);
+        await sink.write(head);
+        await sink.write(blob);
+        offset += head.length + info.size;
+        dir.push(e);
+        this.count = dir.length;
+        return e;
+      },
+      async finish() {
+        const recs = [];
+        let cdSize = 0;
+        dir.forEach(function (e) {
+          const r = zipCentralRecord(e, st);
+          recs.push(r);
+          cdSize += r.length;
+        });
+        await sink.write(recs);
+        await sink.write(zipEndRecords(dir.length, cdSize, offset));
+        return { count: dir.length, size: offset };
+      }
+    };
+  }
+
+  function memorySink(parts) {
+    return {
+      write: function (p) {
+        if (Array.isArray(p)) { for (let i = 0; i < p.length; i++) parts.push(p[i]); }
+        else parts.push(p);
+      }
+    };
+  }
+
+  async function buildZipBlob(entries) {
+    const parts = [];
+    const zip = makeZipWriter(memorySink(parts));
+    for (let i = 0; i < entries.length; i++) await zip.add(entries[i].name, entries[i].blob);
+    await zip.finish();
+    return new Blob(parts, { type: 'application/zip' });
+  }
+
+  // 「另存为」流式写盘（Chrome / Edge）：整包不占内存。
+  // 返回 'abort'（用户取消）/ null（不支持 → 退回内存打包）/ sink。
+  async function pickZipSink(name) {
+    if (typeof window.showSaveFilePicker !== 'function') return null;
+
+    let handle = null;
+    try {
+      handle = await window.showSaveFilePicker({
+        suggestedName: name,
+        types: [{ description: 'ZIP 压缩包', accept: { 'application/zip': ['.zip'] } }]
+      });
+    } catch (e) {
+      return (e && e.name === 'AbortError') ? 'abort' : null;
+    }
+
+    let w = null;
+    try {
+      w = await handle.createWritable();
+    } catch (e) {
+      return null;
+    }
+
+    let closed = false;
+    return {
+      async write(p) {
+        const list = Array.isArray(p) ? p : [p];
+        for (let i = 0; i < list.length; i++) await w.write(list[i]);
+      },
+      async close() { if (!closed) { closed = true; await w.close(); } },
+      async abort() {
+        if (closed) return;
+        closed = true;
+        try { await w.abort(); } catch (e) { /* 忽略 */ }
+      }
+    };
   }
 
   /* ---------------- 初始化 ---------------- */
@@ -1626,6 +2634,9 @@
     geoInput.addEventListener('input', function () {
       state.meta.location = geoInput.value;
       state.locationSource = 'manual';
+      const item = activeItem();
+      if (item) item.geoSource = 'manual';
+      markActiveEdited();
       setGeoStatus(cleanStr(geoInput.value) ? '手动填写' : '未获取');
       schedulePreview();
     });
@@ -1741,14 +2752,60 @@
     });
 
     exportBtn.addEventListener('click', doExport);
+    exportAllBtn.addEventListener('click', doExportAll);
+    exportCancelBtn.addEventListener('click', function () { batch.exportCancel = true; });
 
-    dropzone.addEventListener('click', function () { fileInput.click(); });
-    changeBtn.addEventListener('click', function () { fileInput.click(); });
+    batchModeRadios.forEach(function (r) {
+      r.addEventListener('change', function () {
+        if (!r.checked) return;
+        state.batchMode = r.value;
+      });
+    });
+
+    let pickMode = 'add';
+    let picking = false;
+    const openPicker = function (mode) {
+      // fileInput.click() 派发的 click 会冒泡到 #dropzone，若不挡住就会把模式改回 add
+      if (picking) return;
+      picking = true;
+      pickMode = mode;
+      fileInput.multiple = (mode === 'add');   // 追加时可多选；「更换当前」只挑一张
+      try { fileInput.click(); } finally { picking = false; }
+    };
+
+    clearBtn.addEventListener('click', resetQueue);
+    prevBtn.addEventListener('click', function () { stepItem(-1); });
+    nextBtn.addEventListener('click', function () { stepItem(1); });
+    addBtn.addEventListener('click', function () { openPicker('add'); });
+
+    geocodeChk.addEventListener('change', function () {
+      if (geocodeChk.checked) startGeocodeQueue();
+      else if (batch.geocoding) batch.geoCancel = true;
+    });
+
+    // ← → 切换队列里的上一张 / 下一张（输入框内不拦截）
+    document.addEventListener('keydown', function (e) {
+      if (batch.items.length < 2) return;
+      const t = e.target;
+      if (t && (t.tagName === 'INPUT' || t.tagName === 'SELECT' ||
+                t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+      if (e.key === 'ArrowLeft') { stepItem(-1); e.preventDefault(); }
+      else if (e.key === 'ArrowRight') { stepItem(1); e.preventDefault(); }
+    });
+
+    dropzone.addEventListener('click', function (e) {
+      if (e.target === fileInput) return;      // 忽略 input.click() 冒泡上来的那次
+      openPicker('add');
+    });
+    changeBtn.addEventListener('click', function () { openPicker('replace'); });
 
     fileInput.addEventListener('change', function () {
-      const f = fileInput.files && fileInput.files[0];
-      if (f) handleFile(f);
+      const files = fileInput.files;
+      const mode = pickMode;
+      if (files && files.length) handleFiles(files, mode);
       fileInput.value = '';
+      pickMode = 'add';            // 恢复默认语义：点拖入区 / 添加图片 都是「追加」
+      fileInput.multiple = true;
     });
 
     attachDrop(previewPane);
@@ -1761,6 +2818,7 @@
     applyMode();
     syncSizeControl();
     applyBrandStyle();
+    updateBatchUI();
   }
 
   init();
