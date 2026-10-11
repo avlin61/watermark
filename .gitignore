@@ -1,0 +1,5 @@
+# macOS Finder 生成的垃圾文件
+.DS_Store
+
+# 编辑器个人配置
+.vscode/
