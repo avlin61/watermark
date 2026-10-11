@@ -17,7 +17,7 @@ web/                前端本体（纯静态，没有构建步骤）
   app.js            全部逻辑：EXIF → 布局 → 合成 → 导出
   style.css         样式
   logos.js          机身/镜头品牌 SVG 标志
-  vendor/           本地依赖（exifr，读 EXIF），随仓库附带，离线可用
+  vendor/           本地依赖（exifr，读 EXIF）与第三方许可文本，随仓库附带，离线可用
 src-tauri/          桌面壳（Rust + Tauri 2）：开窗口、加载 web/、提供系统「另存为」
 scripts/            图标生成脚本（make-icons.sh / png2ico.py）
 ```
@@ -108,3 +108,29 @@ cargo tauri build
 
 `.github/workflows/build.yml` 在 push / tag 时于 macOS、Windows、Linux 三平台各自
 `cargo tauri build`，并把安装包作为 artifacts 上传，便于出全平台安装包。
+
+## 许可
+
+本项目采用 **BSD Zero Clause License（0BSD）**，全文见 [LICENSE](LICENSE)。
+
+- ✅ 可以自由使用、修改、分发、**商业使用**、闭源集成
+- ✅ **无需署名**，也无需随作品保留任何声明
+- ⚠️ 软件按「原样」提供，作者不提供任何担保，不承担任何赔偿责任
+
+### 第三方资源与许可
+
+| 资源 | 用途 / 位置 | 许可 | 版权与声明 |
+| --- | --- | --- | --- |
+| [exifr](https://github.com/MikeKovarik/exifr) v7.1.3 | 读取照片 EXIF 元数据（`web/vendor/`） | MIT | © 2020 Mike Kovařík, Mutiny.cz → [LICENSE-exifr.txt](web/vendor/LICENSE-exifr.txt) |
+| [simple-icons](https://simpleicons.org) | 品牌 LOGO 矢量路径（`web/logos.js`） | CC0 1.0 | simple-icons contributors |
+| [Lucide](https://lucide.dev) | 通用界面图标（`web/logos.js`） | ISC；部分图标源自 Feather（MIT） | © Lucide Icons and Contributors / © 2013-present Cole Bemis → [LICENSE-lucide.txt](web/vendor/LICENSE-lucide.txt) |
+| Nominatim / OpenStreetMap | 地名反查（联网） | ODbL | © OpenStreetMap contributors |
+
+> 应用图标（`src-tauri/icons/`）由本项目自制。
+>
+> 品牌名称与商标（各相机、镜头厂商等）权利归各自所有者。本项目中的品牌 LOGO
+> 取自 simple-icons，仅用于照片信息排版中的品牌标识，不代表任何隶属、赞助或
+> 授权关系；**商标权不受上述 CC0 / ISC / MIT 许可覆盖**。使用者若将本项目用于
+> 商业用途，需自行确认其使用方式不侵犯相关商标权。
+>
+> 使用 OSM/Nominatim 数据时，请遵守其 [使用政策](https://operations.osmfoundation.org/policies/nominatim/)（含署名与限流要求）。
