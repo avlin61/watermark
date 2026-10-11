@@ -217,7 +217,7 @@
           </div>
 
           <div class="control">
-            <div class="control-label"><span>文字高度</span><b id="sizeVal">—</b></div>
+            <div class="control-label"><span>字号</span><b id="sizeVal">—</b></div>
             <input type="range" id="sizeRange" min="8" max="240" step="1" value="60" disabled />
             <p class="hint" id="sizeHint">载入图片后可按像素精确调整（步进 1px）。</p>
           </div>
@@ -246,12 +246,18 @@
           </div>
 
           <div class="control">
-            <div class="control-label"><span>垂直位置</span></div>
+            <div class="control-label"><span>垂直对齐</span></div>
             <div class="segmented">
               <label><input type="radio" name="valign" value="top" /><span>靠上</span></label>
               <label><input type="radio" name="valign" value="middle" checked /><span>居中</span></label>
               <label><input type="radio" name="valign" value="bottom" /><span>靠下</span></label>
             </div>
+          </div>
+
+          <div class="control">
+            <div class="control-label"><span>垂直位置</span><b id="posVal">—</b></div>
+            <input type="range" id="posRange" min="-1" max="1" step="1" value="0" disabled />
+            <p class="hint" id="posHint">载入图片后可按像素上下微调（1px 步进）。</p>
           </div>
 
           <label class="check-row">

@@ -2,6 +2,7 @@
    水印框 · 图片信息水印工具
    第二阶段：虚化背景 / 文字样式 / 字段开关 / 地理位置反查 / 自定义文案
    第三阶段：内置矢量 LOGO（文字 or LOGO）/ 像素级文字高度
+   第四阶段：文字块垂直位置微调（1px）/ LOGO 与型号文字底部对齐
    全部逻辑在浏览器本地执行，照片不会被上传。
    ============================================================ */
 
@@ -69,6 +70,9 @@
   const logoSizeRange  = $('logoSizeRange');
   const logoSizeValEl  = $('logoSizeVal');
   const sizeHintEl     = $('sizeHint');
+  const posRange       = $('posRange');
+  const posValEl       = $('posVal');
+  const posHintEl      = $('posHint');
 
   const formatRadios   = arr(document.querySelectorAll('input[name="format"]'));
   const qualityRow     = $('qualityRow');
@@ -191,6 +195,7 @@
     textColor: '#141414',
     align: 'left',
     valign: 'middle',
+    textOffset: 0,        // 文字块垂直微调（输出像素，正 = 向下）
     icons: true,
     brandStyle: 'text',   // text | logo | both
     logoKey: 'auto',      // auto（按品牌匹配）或具体 LOGO key
@@ -272,6 +277,72 @@
   }
 
   function hasPath2D() { return typeof Path2D === 'function'; }
+
+  /* ---------------- 字体度量（行顶 → 基线 / 大写字高） ---------------- */
+  // 用像素采样量出“行顶到基线”的偏移与大写字高：
+  //  · LOGO 据此与文字底部真正对齐（不是简单地垂直居中）
+  //  · LOGO 高度 / 高度读数也换算成真实像素
+  const fontMetricCache = Object.create(null);
+  let scratchCanvas = null;
+
+  function scratchCtx() {
+    if (!scratchCanvas) {
+      scratchCanvas = document.createElement('canvas');
+      scratchCanvas.width = 1;
+      scratchCanvas.height = 1;
+    }
+    return scratchCanvas.getContext('2d');
+  }
+
+  // textBaseline = 'top' 时绘制 'H'（下缘正好在基线上），像素范围即给出 ascent 与 cap
+  function fontMetrics(stack, weight, px) {
+    const size = Math.max(1, Math.round(px));
+    const key = weight + '|' + size + '|' + stack;
+    if (fontMetricCache[key]) return fontMetricCache[key];
+
+    let res = { ascent: size * 0.90, cap: size * LOGO_CAP };   // 读不到像素时的估算值
+    try {
+      const w = Math.max(8, Math.ceil(size * 4));
+      const h = Math.max(8, Math.ceil(size * 2.4));
+      const c = document.createElement('canvas');
+      c.width = w;
+      c.height = h;
+      const g = c.getContext('2d');
+      const y0 = Math.ceil(size * 0.7);
+      g.font = weight + ' ' + size + 'px ' + stack;
+      g.textAlign = 'left';
+      g.textBaseline = 'top';
+      g.fillStyle = '#fff';
+      g.fillText('H', 1, y0);
+      const data = g.getImageData(0, 0, w, h).data;
+      let top = -1;
+      let bot = -1;
+      for (let y = 0; y < h; y++) {
+        let ink = false;
+        for (let x = 0; x < w; x++) {
+          if (data[(y * w + x) * 4 + 3] > 16) { ink = true; break; }
+        }
+        if (!ink) continue;
+        if (top < 0) top = y;
+        bot = y;
+      }
+      if (top >= 0 && bot > top) res = { ascent: bot + 1 - y0, cap: bot + 1 - top };
+    } catch (e) { /* 忽略：使用估算值 */ }
+
+    fontMetricCache[key] = res;
+    return res;
+  }
+
+  // 字符串在基线以下的可见深度（"X-T5" 这类无下降部的型号 ≈ 0）
+  function inkDescent(ctx, str) {
+    if (!str) return 0;
+    ctx.save();
+    ctx.textBaseline = 'alphabetic';
+    const m = ctx.measureText(str);
+    ctx.restore();
+    const d = m.actualBoundingBoxDescent;
+    return (typeof d === 'number' && isFinite(d) && d > 0) ? d : 0;
+  }
 
   // 用 Path2D 绘制内嵌 SVG 图标（尺寸为 size×size 像素）
   function drawIcon(ctx, name, x, y, size, color) {
@@ -795,6 +866,7 @@
       sizeValEl.textContent = '—';
       sizeHintEl.textContent = '载入图片后可按像素精确调整（步进 1px）。';
       syncLogoSizeLabel();
+      syncPosControl();
       return;
     }
 
@@ -811,12 +883,76 @@
       '%） · 当前为短边 ' + (px / Math.max(1, shortSide()) * 100).toFixed(2) + '% · 步进 1px';
 
     syncLogoSizeLabel();
+    syncPosControl();
   }
 
   function syncLogoSizeLabel() {
     const pct = Math.round(state.logoScale * 100);
-    const px = Math.round(currentTitlePx() * LOGO_CAP * state.logoScale);
+    const stack = FONT_PRESETS[state.fontKey] || FONT_PRESETS.system;
+    const titlePx = Math.round(currentTitlePx());
+    const cap = titlePx > 0 ? fontMetrics(stack, KIND_STYLE.title.weight, titlePx).cap : 0;
+    const px = Math.round(cap * state.logoScale);
     logoSizeValEl.textContent = px > 0 ? pct + '% · ' + px + 'px' : pct + '%';
+  }
+
+  /* ---------------- 垂直位置（像素微调） ---------------- */
+  // 以「垂直对齐」为基准上下微调：滑块值 = 输出像素偏移（1px 步进）
+  function outputBox() {
+    const fullW = state.img.naturalWidth;
+    const fullH = state.img.naturalHeight;
+    const b = Math.round(state.borderWidth);
+    const be = Math.round(state.bottomExtra);
+    return {
+      x: b,
+      y: b + fullH,
+      w: fullW,
+      h: be,
+      scale: 1,
+      base: Math.min(fullW, fullH),
+      canvasH: fullH + b * 2 + be
+    };
+  }
+
+  function disablePosControl(hint) {
+    posRange.disabled = true;
+    posRange.min = '-1';
+    posRange.max = '1';
+    posRange.value = '0';
+    state.textOffset = 0;
+    posValEl.textContent = '—';
+    posHintEl.textContent = hint;
+  }
+
+  function syncPosControl() {
+    if (!posRange) return;
+
+    if (!state.img) {
+      disablePosControl('载入图片后可按像素上下微调（1px 步进）。');
+      return;
+    }
+
+    const box = outputBox();
+    const lay = textLayout(box);
+    if (!lay.rows.length || box.h <= 1) {
+      disablePosControl('当前没有可排版的文字内容。');
+      return;
+    }
+
+    const lim = textBlockY(box, lay.metrics, 0);
+    const lo = Math.min(Math.round(lim.minY - lim.base), Math.round(lim.maxY - lim.base));
+    const hi = Math.max(Math.round(lim.minY - lim.base), Math.round(lim.maxY - lim.base));
+
+    state.textOffset = Math.min(Math.max(state.textOffset, lo), hi);
+
+    posRange.disabled = hi <= lo;
+    posRange.min = String(lo);
+    posRange.max = String(hi);
+    posRange.value = String(state.textOffset);
+
+    const gapPx = Math.round(box.canvasH - (lim.y + state.textOffset + lay.metrics.blockInkH));
+    posValEl.textContent = (state.textOffset > 0 ? '+' : '') + state.textOffset + ' px';
+    posHintEl.textContent = '文字下缘距画布底 ' + gapPx + 'px · 可在 ' + lo + ' ~ ' +
+      (hi > 0 ? '+' : '') + hi + 'px 内微调（1px 步进）；改「垂直对齐」会归零。';
   }
 
   /* ---------------- 尺寸范围 ---------------- */
@@ -969,7 +1105,8 @@
     const base = box.base;
     const iconsOn = state.icons && hasPath2D();
     const out = { sizes: [], widths: [], rowH: [], gaps: [], items: [], sepW: [],
-                  logoH: [], logoW: [], logoGap: [], blockH: 0, maxW: 0 };
+                  logoH: [], logoW: [], logoGap: [], asc: [], inkBottom: [], topOver: [],
+                  blockH: 0, blockInkH: 0, topGuard: 0, maxW: 0 };
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -977,10 +1114,15 @@
       const size = Math.max(1, base * st.size * state.fontScale * f * box.scale);
       ctx.font = st.weight + ' ' + Math.round(size) + 'px ' + stack;
 
+      const fm = fontMetrics(stack, st.weight, Math.round(size));
+
       out.sizes[i] = size;
       out.rowH[i] = size;
       out.gaps[i] = 0;
       out.items[i] = [];
+      out.asc[i] = fm.ascent;                                     // 行顶 → 文字基线
+      out.inkBottom[i] = fm.ascent + (row.text ? inkDescent(ctx, row.text) : 0);  // 行顶 → 可见下缘
+      out.topOver[i] = 0;
 
       let w;
       if (row.kind === 'meta') {
@@ -1001,16 +1143,18 @@
           total += textW;
         }
         w = total;
+        if (iconsOn) out.inkBottom[i] = Math.max(out.inkBottom[i], (size + iconSize) / 2);
       } else {
         w = row.text ? ctx.measureText(row.text).width : 0;
-        // 标题行前面可能有内置 LOGO：生成高度按文字高度比例算，宽度按字形比例算
+        // 标题行前面可能有内置 LOGO：高度取文字的大写字高，底部与文字可见下缘对齐
         if (row.logo) {
-          const lh = size * LOGO_CAP * state.logoScale;
+          const lh = fm.cap * state.logoScale;
           const lw = logoWidth(row.logo, lh);
           const gap = row.text ? size * 0.34 : 0;
           out.logoH[i] = lh;
           out.logoW[i] = lw;
           out.logoGap[i] = gap;
+          out.topOver[i] = Math.max(0, lh - out.inkBottom[i]);   // LOGO 顶高出文字下缘的部分
           w += lw + gap;
         }
       }
@@ -1020,7 +1164,11 @@
     }
 
     let blockH = 0;
+    let topGuard = 0;
+    let inkH = 0;
     for (let i = 0; i < rows.length; i++) {
+      if (out.topOver[i] > 0) topGuard = Math.max(topGuard, out.topOver[i] - blockH);
+      if (blockH + out.inkBottom[i] > inkH) inkH = blockH + out.inkBottom[i];
       blockH += out.sizes[i];
       if (i > 0) {
         const g = state.gap * out.sizes[i];
@@ -1029,17 +1177,16 @@
       }
     }
     out.blockH = blockH;
+    out.topGuard = topGuard;     // 块顶之上还需留出的空间（LOGO 顶部高出时）
+    out.blockInkH = inkH;        // 块顶 → 可见下缘
     return out;
   }
 
-  /* ---------------- 绘制文字区 ---------------- */
-  function drawTextArea(ctx, box) {
+  /* ---------------- 排版求解（测量 → 适配 → 垂直定位） ---------------- */
+  function textLayout(box) {
     const rows = buildRows();
-    if (!rows.length || box.h <= 1) return;
-
     const stack = FONT_PRESETS[state.fontKey] || FONT_PRESETS.system;
-    const color = effectiveTextColor();
-    const iconsOn = state.icons && hasPath2D();
+    const ctx = scratchCtx();
 
     // 先按原始字号测量，必要时整体等比缩小以适配边框区域
     let f = 1;
@@ -1052,13 +1199,40 @@
       metrics = measureRows(ctx, rows, box, stack, f);
     }
 
-    // 垂直定位
+    return { rows: rows, stack: stack, ctx: ctx, f: f, metrics: metrics };
+  }
+
+  // 文字块上边界：垂直对齐得到基准位置，再叠加像素微调，并保证不越出边框区域
+  function textBlockY(box, metrics, offsetPx) {
     const slack = Math.max(0, box.h - metrics.blockH);
     const padY = Math.min(Math.max(1, box.h * 0.08), slack / 2);
+
     let y = box.y + padY;
     if (state.valign === 'middle') y = box.y + slack / 2;
     else if (state.valign === 'bottom') y = box.y + box.h - padY - metrics.blockH;
-    y = Math.max(box.y, Math.min(y, box.y + box.h - metrics.blockH));
+
+    const base = y;
+    const minY = box.y + metrics.topGuard;
+    const maxY = Math.max(minY, box.y + box.h - metrics.blockH);
+    const off = (offsetPx || 0) * (box.scale || 1);
+
+    y = Math.max(minY, Math.min(base + off, maxY));
+    return { y: y, base: base, minY: minY, maxY: maxY };
+  }
+
+  /* ---------------- 绘制文字区 ---------------- */
+  function drawTextArea(ctx, box) {
+    const lay = textLayout(box);
+    const rows = lay.rows;
+    if (!rows.length || box.h <= 1) return;
+
+    const stack = lay.stack;
+    const metrics = lay.metrics;
+    const color = effectiveTextColor();
+    const iconsOn = state.icons && hasPath2D();
+
+    // 垂直定位（含 1px 微调）
+    let y = textBlockY(box, metrics, state.textOffset).y;
 
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
@@ -1097,7 +1271,9 @@
         let tx = x;
         if (row.logo) {
           const lh = metrics.logoH[i] || 0;
-          drawLogo(ctx, row.logo, x, y + (size - lh) / 2, lh, color);
+          // 底部对齐：LOGO 下缘 = 文字可见下缘（型号这类无下降部的文字即基线）
+          const inkBottom = y + (metrics.inkBottom[i] || 0);
+          drawLogo(ctx, row.logo, x, inkBottom - lh, lh, color);
           tx = x + (metrics.logoW[i] || 0) + (row.text ? (metrics.logoGap[i] || 0) : 0);
         }
         if (row.text) ctx.fillText(row.text, tx, y);
@@ -1225,6 +1401,7 @@
     const psrc = state.previewSource || state.img;
     const scale = (psrc === state.img) ? 1 : (psrc.width / fullW);
     compose(psrc, scale, fullW, fullH, previewCanvas);
+    syncPosControl();
   }
 
   /* ---------------- 导出 ---------------- */
@@ -1533,8 +1710,16 @@
       r.addEventListener('change', function () {
         if (!r.checked) return;
         state.valign = r.value;
+        state.textOffset = 0;          // 换对齐方式即回到基准位置
+        syncPosControl();
         schedulePreview();
       });
+    });
+
+    posRange.addEventListener('input', function () {
+      state.textOffset = Number(posRange.value) || 0;
+      syncPosControl();
+      schedulePreview();
     });
 
     iconChk.addEventListener('change', function () {
