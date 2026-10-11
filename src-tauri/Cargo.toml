@@ -1,6 +1,6 @@
 [package]
 name = "watermark"
-version = "1.0.0"
+version = "1.0.1"
 description = "水印框 · 本地图片信息水印工具"
 authors = ["水印框"]
 edition = "2021"

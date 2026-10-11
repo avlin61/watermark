@@ -72,7 +72,7 @@ cargo tauri build
 
 | 平台 | 路径 |
 | --- | --- |
-| macOS | `src-tauri/target/release/bundle/macos/Watermark.app`、`bundle/dmg/Watermark_1.0.0_aarch64.dmg` |
+| macOS | `src-tauri/target/release/bundle/macos/Watermark.app`、`bundle/dmg/Watermark_1.0.1_aarch64.dmg` |
 | Windows | `src-tauri/target/release/bundle/msi/*.msi`、`bundle/nsis/*-setup.exe` |
 | Linux | `src-tauri/target/release/bundle/deb/*.deb`、`bundle/rpm/*.rpm`、`bundle/appimage/*.AppImage` |
 
@@ -103,6 +103,9 @@ cargo tauri build
 - 水印里的品牌 LOGO 与字体依赖本机资源，缺字体时用系统兜底字体。
 - 「地名反查」用 Nominatim，需要联网；失败/被限流时退化为显示经纬度，也可手填地点。
 - 批量导出是逐张渲染 + 压缩，几百张的大队列会比较慢（进度条与「取消导出」可用）。
+- 「虚化背景」在网页版（Chrome/Edge）走 canvas 的原生 `ctx.filter`；macOS 桌面壳用的
+  WKWebView 不支持该属性，会自动退化为 `web/app.js` 里自实现的三次方框模糊（近似高斯，
+  视觉一致）。
 
 ## 持续集成
 

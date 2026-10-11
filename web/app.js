@@ -1333,6 +1333,68 @@
     return Math.max(0, (state.blur / 100) * dim * 0.10);
   }
 
+  // 单方向（横向/纵向）的滑动窗口方框模糊，边缘夹取，复杂度 O(n)。
+  // data 是 RGBA 的 Uint8ClampedArray，就地改写。
+  function boxBlurPass(data, w, h, r, horizontal) {
+    const n = horizontal ? w : h;
+    const m = horizontal ? h : w;
+    if (n <= 1 || r < 1) return;
+    const idx = horizontal
+      ? (line, i) => (line * w + i) * 4
+      : (line, i) => (i * w + line) * 4;
+    const width = r * 2 + 1;
+    const out = new Uint8ClampedArray(n * 4);
+    for (let line = 0; line < m; line++) {
+      let sr = 0;
+      let sg = 0;
+      let sb = 0;
+      let sa = 0;
+      for (let k = -r; k <= r; k++) {
+        const i = idx(line, Math.min(n - 1, Math.max(0, k)));
+        sr += data[i];
+        sg += data[i + 1];
+        sb += data[i + 2];
+        sa += data[i + 3];
+      }
+      for (let i = 0; i < n; i++) {
+        const o = i * 4;
+        out[o] = sr / width;
+        out[o + 1] = sg / width;
+        out[o + 2] = sb / width;
+        out[o + 3] = sa / width;
+        const add = idx(line, Math.min(n - 1, i + r + 1));
+        const sub = idx(line, Math.max(0, i - r));
+        sr += data[add] - data[sub];
+        sg += data[add + 1] - data[sub + 1];
+        sb += data[add + 2] - data[sub + 2];
+        sa += data[add + 3] - data[sub + 3];
+      }
+      for (let i = 0; i < n; i++) {
+        const p = idx(line, i);
+        const o = i * 4;
+        data[p] = out[o];
+        data[p + 1] = out[o + 1];
+        data[p + 2] = out[o + 2];
+        data[p + 3] = out[o + 3];
+      }
+    }
+  }
+
+  // 就地模糊一张 canvas：3 次方框模糊 ≈ 高斯模糊（半径 ≈ σ）。
+  // 给不支持 ctx.filter 的浏览器兜底（Safari / WKWebView 的 canvas 至今不支持该属性）。
+  function blurCanvasInPlace(canvas, sigmaPx) {
+    const r = Math.round(sigmaPx);
+    if (!(r > 0) || canvas.width < 2 || canvas.height < 2) return;
+    const bctx = canvas.getContext('2d');
+    if (!bctx) return;
+    const img = bctx.getImageData(0, 0, canvas.width, canvas.height);
+    for (let pass = 0; pass < 3; pass++) {
+      boxBlurPass(img.data, canvas.width, canvas.height, r, true);
+      boxBlurPass(img.data, canvas.width, canvas.height, r, false);
+    }
+    bctx.putImageData(img, 0, 0);
+  }
+
   // 原图 cover 铺满画布 + 高斯模糊（先小画布再放大，性能更好）
   function drawBlurBg(ctx, source, cw, ch) {
     const src = sourceSize(source);
@@ -1354,6 +1416,10 @@
     const canFilter = ('filter' in ctx);
     // 高斯核有效支持半径约 3σ，出血量取 3.5 倍以避免画布边缘出现透明度
     const bleed = Math.ceil(blurPx * 3.5) + 4;
+
+    // Safari / WKWebView 的 canvas 不支持 ctx.filter，退化为自实现的高斯近似模糊（否则背景会完全不虚化）。
+    // 这里模糊的是缩放后的小画布，半径要按缩放比折算，否则桌面版会糊得比网页版轻。
+    if (!canFilter && blurPx > 0) blurCanvasInPlace(tmp, blurPx * (tmpW / cw));
 
     ctx.save();
     if (canFilter) ctx.filter = 'blur(' + blurPx.toFixed(2) + 'px)';
