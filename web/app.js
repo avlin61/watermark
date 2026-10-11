@@ -1478,18 +1478,21 @@
       const type = isJpeg ? 'image/jpeg' : 'image/png';
       const quality = isJpeg ? state.quality : undefined;
 
-      canvas.toBlob(function (blob) {
+      canvas.toBlob(async function (blob) {
         if (!blob) {
           showNotice('导出失败：无法生成图片数据。', 'warn');
           done();
           return;
         }
-        const url = URL.createObjectURL(blob);
-        triggerDownload(url, buildOutName(state.fileName, isJpeg ? 'jpg' : 'png'));
-        setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+        const res = await saveBlob(blob, buildOutName(state.fileName, isJpeg ? 'jpg' : 'png'));
+        if (res.cancelled) {
+          showNotice('已取消导出。', 'info');
+          done();
+          return;
+        }
 
         showNotice('已导出 ' + canvas.width + ' × ' + canvas.height +
-          ' 的成品图（原图保持原始分辨率）。', 'ok');
+          ' 的成品图' + (res.path ? '：' + res.path : '') + '（原图保持原始分辨率）。', 'ok');
         done();
       }, type, quality);
     } catch (err) {
@@ -2115,6 +2118,40 @@
     a.remove();
   }
 
+  /* ---------------- 桌面版（Tauri）：系统原生「另存为」 ---------------- */
+  // 桌面壳（withGlobalTauri）会注入 window.__TAURI__；网页版没有它，仍走浏览器下载。
+  const tauriCore = (window.__TAURI__ && window.__TAURI__.core &&
+    typeof window.__TAURI__.core.invoke === 'function') ? window.__TAURI__.core : null;
+
+  function bytesToBase64(u8) {
+    let s = '';
+    const CHUNK = 0x8000;
+    for (let i = 0; i < u8.length; i += CHUNK) {
+      s += String.fromCharCode.apply(null, u8.subarray(i, i + CHUNK));
+    }
+    return btoa(s);
+  }
+
+  // 保存 blob：
+  //   桌面版 → 弹系统「另存为」，返回 { path }（已保存）或 { cancelled: true }；
+  //   网页版 → 触发浏览器下载，返回 { download: true }。
+  async function saveBlob(blob, name) {
+    if (tauriCore) {
+      try {
+        const buf = new Uint8Array(await blob.arrayBuffer());
+        const saved = await tauriCore.invoke('save_native', { name: name, b64: bytesToBase64(buf) });
+        if (saved) return { path: String(saved) };
+        return { cancelled: true };
+      } catch (e) {
+        showNotice('系统保存对话框不可用（' + String((e && e.message) || e) + '），改用浏览器下载。', 'warn');
+      }
+    }
+    const url = URL.createObjectURL(blob);
+    triggerDownload(url, name);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+    return { download: true };
+  }
+
   function exportCanvas() {
     if (!exportCanvasEl) exportCanvasEl = document.createElement('canvas');
     return exportCanvasEl;
@@ -2233,6 +2270,9 @@
     const rows = [];          // 内存打包：{ name, blob }
     const failed = [];
     const done = [];          // 本次已写出的项
+    let skipped = 0;          // 逐张模式下用户取消了「另存为」的张数
+    let saveCancelled = false; // 打包模式下用户取消了「另存为」
+    let savedAt = '';          // 打包模式下保存到的路径（桌面版）/ 仍走下载时为空
 
     // 打包模式优先「另存为」流式写盘：整包不占内存
     let sink = null;
@@ -2259,18 +2299,24 @@
         try {
           const blob = await renderItemBlob(item, type, quality);
           const name = uniqueName(used, item.name, ext);
+          let ok = true;
           if (zipMode) {
             if (zip) await zip.add(name, blob);
             else rows.push({ name: name, blob: blob });
           } else {
-            const url = URL.createObjectURL(blob);
-            triggerDownload(url, name);
-            setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+            const res = await saveBlob(blob, name);   // 桌面版走系统「另存为」，网页版走浏览器下载
+            ok = !res.cancelled;                     // 用户取消了这一张的保存
           }
-          item.status = 'done';
-          item.error = '';
-          done.push(item);
-          releaseOtherImages(activeItem());      // 只留当前预览那张的大图
+          if (ok) {
+            item.status = 'done';
+            item.error = '';
+            done.push(item);
+            releaseOtherImages(activeItem());      // 只留当前预览那张的大图
+          } else {
+            skipped++;
+            item.status = 'ready';
+            item.error = '';
+          }
         } catch (e) {
           item.error = '导出失败：' + String((e && e.message) || e);
           failed.push(item.name);
@@ -2289,22 +2335,29 @@
           await sink.close();
         } else {
           const blob = await buildZipBlob(rows);
-          const url = URL.createObjectURL(blob);
-          triggerDownload(url, batchZipName());
-          setTimeout(function () { URL.revokeObjectURL(url); }, 10000);
+          const res = await saveBlob(blob, batchZipName());   // 桌面版走系统「另存为」
+          if (res.cancelled) {
+            done.forEach(function (x) { x.status = 'ready'; });   // 没保存成，状态回退
+            saveCancelled = true;
+          } else if (res.path) {
+            savedAt = '，保存到 ' + res.path;
+          }
         }
       }
 
-      if (cancelled) {
+      if (cancelled || saveCancelled) {
         showNotice('已取消批量导出' +
           (zipMode ? '（没有生成文件）' : '（已下载 ' + done.length + ' 张）') + '。', 'info');
+      } else if (!done.length && skipped) {
+        showNotice('已取消批量导出（' + skipped + ' 张都没有保存）。', 'info');
       } else if (failed.length) {
         showNotice('已导出 ' + done.length + '/' + items.length + ' 张' +
           (zipMode ? '（打包 ZIP）' : '（逐张下载）') + '，' + failed.length + ' 张失败：' +
           failed.slice(0, 3).join('、') + (failed.length > 3 ? ' 等' : '') + '。', 'warn');
       } else {
         showNotice('已导出全部 ' + done.length + ' 张' +
-          (zipMode ? '，已打包为 ZIP' : '（逐张下载）') + '。', 'ok');
+          (zipMode ? '，已打包为 ZIP' : '（逐张下载）') + savedAt +
+          (skipped ? '，' + skipped + ' 张已跳过' : '') + '。', 'ok');
       }
     } catch (e) {
       if (sink) await sink.abort();

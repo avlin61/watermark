@@ -376,7 +376,8 @@
   </main>
 
   <!-- EXIF 解析库（CDN） -->
-  <script src="https://cdn.jsdelivr.net/npm/exifr/dist/full.umd.js"></script>
+  <!-- exifr 本地化：桌面版/离线环境不依赖 CDN -->
+  <script src="vendor/exifr.full.umd.js"></script>
   <!-- 内置 LOGO 资源库（本地矢量路径，无需联网） -->
   <script src="logos.js"></script>
   <script src="app.js"></script>

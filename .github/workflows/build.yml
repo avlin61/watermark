@@ -1,0 +1,58 @@
+name: build
+
+# 三平台各自 `cargo tauri build`，产物上传为 artifacts（不写 release，按需再加）
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            bundles: app,dmg
+          - os: ubuntu-22.04
+            bundles: deb,appimage
+          - os: windows-latest
+            bundles: msi,nsis
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux 系统依赖
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev \
+            patchelf build-essential curl wget file libssl-dev libxdo-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: 安装 tauri-cli
+        run: cargo install tauri-cli --locked
+
+      - name: 打包
+        working-directory: src-tauri
+        run: cargo tauri build --bundles ${{ matrix.bundles }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: watermark-${{ matrix.os }}
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release/bundle/**/*.dmg
+            src-tauri/target/release/bundle/**/*.msi
+            src-tauri/target/release/bundle/**/*.exe
+            src-tauri/target/release/bundle/**/*.deb
+            src-tauri/target/release/bundle/**/*.rpm
+            src-tauri/target/release/bundle/**/*.AppImage

@@ -1,0 +1,41 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Watermark",
+  "version": "1.0.0",
+  "identifier": "com.watermark.desktop",
+  "build": {
+    "frontendDist": "../web"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "label": "main",
+        "title": "水印框 · 本地水印工具",
+        "width": 1400,
+        "height": 920,
+        "minWidth": 880,
+        "minHeight": 620,
+        "resizable": true,
+        "center": true
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Photography",
+    "shortDescription": "本地水印工具",
+    "longDescription": "给照片加上边框与拍摄信息水印；EXIF 读取、合成、导出全部在本机完成，不上传服务器。",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
