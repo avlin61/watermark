@@ -69,6 +69,15 @@ body {
 
 .tagline { font-size: 12px; color: var(--text-faint); }
 
+/* 顶栏右侧：撤回 / 重做 / 重置 */
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.topbar-actions .btn-ghost { padding: 5px 10px; }
+
 /* ---------------- 布局 ---------------- */
 .app {
   display: grid;
@@ -362,7 +371,8 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 5px; }
   cursor: pointer;
   transition: color 0.15s, border-color 0.15s;
 }
-.btn-ghost:hover { color: var(--text); border-color: var(--border-strong); }
+.btn-ghost:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+.btn-ghost:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ---------------- 响应式 ---------------- */
 @media (max-width: 860px) {
@@ -373,6 +383,14 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 5px; }
   }
   .preview-pane { min-height: 54vh; }
   .settings-pane { border-left: none; border-top: 1px solid var(--border); }
+}
+
+/* 窄屏：顶栏收起副标题、按钮收紧，保证「撤回 / 重做 / 重置」不被挤出屏幕 */
+@media (max-width: 620px) {
+  .topbar { padding: 0 12px; }
+  .tagline { display: none; }
+  .topbar-actions { gap: 6px; }
+  .topbar-actions .btn-ghost { padding: 4px 8px; font-size: 12px; }
 }
 /* ---------------- 折叠分组 ---------------- */
 .sect {
@@ -527,7 +545,8 @@ input[type="color"]::-webkit-color-swatch { border: none; border-radius: 5px; }
   cursor: pointer;
   transition: color 0.15s, border-color 0.15s;
 }
-.btn-tiny:hover { color: var(--text); border-color: var(--border-strong); }
+.btn-tiny:hover:not(:disabled) { color: var(--text); border-color: var(--border-strong); }
+.btn-tiny:disabled { opacity: 0.4; cursor: not-allowed; }
 
 /* ---------------- 内置 LOGO 选择网格 ---------------- */
 .logo-grid {

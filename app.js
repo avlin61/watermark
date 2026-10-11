@@ -21,6 +21,12 @@
   const previewCanvas  = $('previewCanvas');
   const noticeEl       = $('notice');
 
+  // 顶栏：撤回 / 重做 / 重置
+  const undoBtn        = $('undoBtn');
+  const redoBtn        = $('redoBtn');
+  const resetBtn       = $('resetBtn');
+  const settingsPane   = document.querySelector('.settings-pane');
+
   const fieldsWrap     = $('fields');
   const exifBadge      = $('exifBadge');
 
@@ -1564,7 +1570,11 @@
       previewSource: null,
       thumb: '',
       error: '',
-      userEdited: false
+      userEdited: false,
+      // 「一键重置」用：刚读取时的 EXIF 基线
+      baseValues: null,
+      baseHasExif: false,
+      baseGps: null
     };
   }
 
@@ -1642,6 +1652,10 @@
       item.values.location = coordText(item.gps.latitude, item.gps.longitude);   // 先落坐标兜底
       item.geoSource = 'auto';
     }
+    // 记下「刚读取」的基线：一键重置时拍摄信息回到这里
+    item.baseValues = Object.assign({}, item.values);
+    item.baseHasExif = !!item.hasExif;
+    item.baseGps = item.gps ? { latitude: item.gps.latitude, longitude: item.gps.longitude } : null;
     item.thumb = await makeThumb(item.file);
     if (!item.thumb && !item.img) item.img = await loadImage(item.file);   // 缩略图失败也要确认能解码
   }
@@ -1944,6 +1958,7 @@
 
     syncPrepProgress();
     renderStrip();
+    syncHistoryUI();
   }
 
   function removeItem(id) {
@@ -1998,6 +2013,7 @@
     syncSizeControl();              // 会禁用字号滑块并复位「垂直位置」
     updateBatchUI();
     clearNotice();
+    clearHistory();                // 队列清空 = 重新开始，旧的撤回历史不再有意义
   }
 
   /* ---------------- 处理文件 ---------------- */
@@ -2569,11 +2585,292 @@
     };
   }
 
+  /* ---------------- 撤回 / 重做 / 重置（设置与拍摄信息快照） ---------------- */
+  // 快照内容 = 右侧所有设置 + 每张照片的拍摄信息。队列里图片的增删（文件本身）不进撤回栈：
+  // 那属于「换素材」，重新拖入即可，避免撤回时反复解码大图。
+  const DOC_KEYS = [
+    'customText', 'customPos', 'bgMode', 'borderWidth', 'bottomExtra', 'borderColor', 'blur',
+    'darken', 'shadow', 'fontKey', 'fontScale', 'gap', 'autoColor', 'textColor', 'align',
+    'valign', 'textOffset', 'icons', 'brandStyle', 'logoKey', 'logoScale', 'format', 'quality',
+    'batchMode', 'hideLocation'
+  ];
+  const HISTORY_MAX = 60;          // 最多保留的步数
+  const HISTORY_MERGE_MS = 900;    // 连续拖动 / 连续输入合并成一步的时间窗
+
+  const history = { stack: [], redo: [], base: null, lastKey: '', lastAt: 0, pruneTimer: 0 };
+
+  // 单张照片的拍摄信息快照；ready=false 表示拍快照时这张还在读取（撤回时不能拿空值盖掉 EXIF）
+  function itemSnapshot(item) {
+    return {
+      ready: item.status !== 'pending' && item.status !== 'prep',
+      values: Object.assign({}, item.values),
+      geoSource: item.geoSource,
+      geoFailed: !!item.geoFailed,
+      geoAsked: !!item.geoAsked,
+      hasExif: !!item.hasExif,
+      gps: item.gps ? { latitude: item.gps.latitude, longitude: item.gps.longitude } : null,
+      userEdited: !!item.userEdited
+    };
+  }
+
+  function docSnapshot() {
+    const style = {};
+    DOC_KEYS.forEach(function (k) { style[k] = state[k]; });
+    style.visible = Object.assign({}, state.visible);
+    style.shadowTouched = shadowTouched;
+
+    const items = {};
+    batch.items.forEach(function (it) { items[it.id] = itemSnapshot(it); });
+
+    return { style: style, items: items };
+  }
+
+  // 只比较「两份快照都管到」的内容：队列里新增的项、被移除的项都不算差异
+  function docDiffers(a, b) {
+    if (!a || !b) return true;
+    if (JSON.stringify(a.style) !== JSON.stringify(b.style)) return true;
+    for (const id in a.items) {
+      const y = b.items[id];
+      if (y && JSON.stringify(a.items[id]) !== JSON.stringify(y)) return true;
+    }
+    return false;
+  }
+
+  function applyItemSnapshot(item, snap, force) {
+    if (!snap || (!force && !snap.ready)) return;
+
+    Object.keys(item.values).forEach(function (k) {
+      if (!(k in snap.values)) delete item.values[k];
+    });
+    Object.assign(item.values, snap.values);      // 就地改，state.meta 的引用保持有效
+    item.geoSource = snap.geoSource;
+    item.geoFailed = !!snap.geoFailed;
+    item.geoAsked = !!snap.geoAsked;
+    item.hasExif = !!snap.hasExif;
+    item.gps = snap.gps ? { latitude: snap.gps.latitude, longitude: snap.gps.longitude } : null;
+    item.userEdited = !!snap.userEdited;
+  }
+
+  // 把界面控件刷成当前 state 的样子（撤回 / 重置后用）
+  function syncDocUI() {
+    setRangePair(borderRange, borderNum, state.borderWidth);
+    setRangePair(bottomRange, bottomNum, state.bottomExtra);
+    borderColorInp.value = state.borderColor;
+    blurRange.value = String(state.blur);
+    blurValEl.textContent = Math.round(state.blur) + '%';
+    darkRange.value = String(state.darken);
+    darkValEl.textContent = Math.round(state.darken) + '%';
+    shadowChk.checked = !!state.shadow;
+
+    bgModeRadios.forEach(function (r) { r.checked = r.value === state.bgMode; });
+    applyMode();                                  // 联动 边框颜色 / 文字颜色 / 投影（内含 updatePreview）
+
+    fontSelect.value = state.fontKey;
+    gapRange.value = String(state.gap);
+    gapValEl.textContent = Number(state.gap).toFixed(2);
+    autoColorChk.checked = !!state.autoColor;
+    textColorInp.value = state.textColor;
+    syncTextColorInput();
+
+    alignRadios.forEach(function (r) { r.checked = r.value === state.align; });
+    valignRadios.forEach(function (r) { r.checked = r.value === state.valign; });
+    iconChk.checked = !!state.icons;
+
+    brandStyleRadios.forEach(function (r) { r.checked = r.value === state.brandStyle; });
+    logoSizeRange.value = String(state.logoScale);
+    applyBrandStyle();                            // 重建 LOGO 选择器高亮 + 状态文案（内含 schedulePreview）
+
+    customInput.value = state.customText;
+    customPosRadios.forEach(function (r) { r.checked = r.value === state.customPos; });
+    CONTENT_ITEMS.forEach(function (item) {
+      if (chipInputs[item.key]) chipInputs[item.key].checked = !!state.visible[item.key];
+    });
+
+    hideLocChk.checked = !!state.hideLocation;
+    geoInput.disabled = state.hideLocation;
+    geoRetry.disabled = state.hideLocation;
+
+    formatRadios.forEach(function (r) { r.checked = r.value === state.format; });
+    qualityRow.classList.toggle('hidden', state.format !== 'jpeg');
+    qualityRange.value = String(state.quality);
+    qualityValEl.textContent = Math.round(state.quality * 100) + '%';
+    batchModeRadios.forEach(function (r) { r.checked = r.value === state.batchMode; });
+
+    syncSizeControl();                            // 字号读数 / 提示 / LOGO 高度换算
+    syncPosControl();                             // 垂直位置（依赖当前图片与文字内容，放最后）
+  }
+
+  // 整体恢复到某个快照：样式 + 每张照片的拍摄信息
+  function applyDoc(snap, forceItems) {
+    if (!snap) return;
+
+    DOC_KEYS.forEach(function (k) { state[k] = snap.style[k]; });
+    state.visible = Object.assign({}, snap.style.visible);
+    shadowTouched = !!snap.style.shadowTouched;
+
+    batch.items.forEach(function (it) { applyItemSnapshot(it, snap.items[it.id], forceItems); });
+
+    state.geoToken++;              // 作废还没回来的地名反查，避免旧结果盖掉恢复出来的文案
+    syncDocUI();
+
+    const cur = activeItem();
+    if (cur) {
+      setMeta(cur.values);
+      setExifBadge(cur.hasExif);
+      syncGeoStatus(cur);
+      geoInput.value = state.hideLocation ? '' : cleanStr(cur.values.location);
+    }
+    updatePreview();
+    updateBatchUI();
+  }
+
+  function syncHistoryUI() {
+    if (!undoBtn || !redoBtn) return;
+    const busy = batch.exporting;
+    undoBtn.disabled = busy || !history.stack.length;
+    redoBtn.disabled = busy || !history.redo.length;
+    if (resetBtn) resetBtn.disabled = busy;
+  }
+
+  function clearHistory() {
+    history.stack.length = 0;
+    history.redo.length = 0;
+    history.lastKey = '';
+    history.lastAt = 0;
+    syncHistoryUI();
+  }
+
+  // 丢掉「与当前状态完全一致」的空步（例如点了本来就选中的选项）
+  function pruneHistory() {
+    history.pruneTimer = 0;
+    const cur = docSnapshot();
+    while (history.stack.length && !docDiffers(history.stack[history.stack.length - 1], cur)) {
+      history.stack.pop();
+    }
+    syncHistoryUI();
+  }
+
+  // 记录「改动前」的状态；同一控件短时间内连续改动合并为一步（拖滑块 / 连续打字）
+  function pushHistory(key, force) {
+    const now = Date.now();
+    const merged = !force && !!key && key === history.lastKey &&
+      (now - history.lastAt) < HISTORY_MERGE_MS;
+    history.lastKey = key || '';
+    history.lastAt = now;
+    if (merged) return;
+
+    history.stack.push(docSnapshot());
+    if (history.stack.length > HISTORY_MAX) history.stack.shift();
+    history.redo.length = 0;
+
+    // 各控件自己的处理函数在本事件里跑完后，再看这次是不是真的改了东西
+    if (history.pruneTimer) clearTimeout(history.pruneTimer);
+    history.pruneTimer = setTimeout(pruneHistory, 0);
+  }
+
+  function undo() {
+    if (batch.exporting) { showNotice('正在导出，导出过程中不能撤回。', 'warn'); return; }
+    if (history.pruneTimer) { clearTimeout(history.pruneTimer); pruneHistory(); }
+
+    const cur = docSnapshot();
+    let target = null;
+    while (history.stack.length) {
+      const top = history.stack.pop();
+      if (docDiffers(top, cur)) { target = top; break; }   // 跳过没产生实际变化的历史
+    }
+    if (!target) { showNotice('没有可撤回的改动了。', 'info'); syncHistoryUI(); return; }
+
+    history.redo.push(cur);
+    if (history.redo.length > HISTORY_MAX) history.redo.shift();
+    history.lastKey = '';
+    history.lastAt = 0;
+    applyDoc(target);
+    showNotice('已撤回上一步改动（Ctrl / ⌘ + Shift + Z 可重做）。', 'ok');
+    syncHistoryUI();
+  }
+
+  function redo() {
+    if (batch.exporting) { showNotice('正在导出，导出过程中不能重做。', 'warn'); return; }
+
+    const cur = docSnapshot();
+    let target = null;
+    while (history.redo.length) {
+      const top = history.redo.pop();
+      if (docDiffers(top, cur)) { target = top; break; }
+    }
+    if (!target) { showNotice('没有可重做的改动了。', 'info'); syncHistoryUI(); return; }
+
+    history.stack.push(cur);
+    if (history.stack.length > HISTORY_MAX) history.stack.shift();
+    history.lastKey = '';
+    history.lastAt = 0;
+    applyDoc(target);
+    showNotice('已重做。', 'ok');
+    syncHistoryUI();
+  }
+
+  // 每张照片都回到「刚读取」时的 EXIF 基线
+  function resetDoc() {
+    const snap = docSnapshot();
+    snap.style = Object.assign({}, history.base ? history.base.style : snap.style);
+    snap.style.visible = Object.assign({},
+      history.base ? history.base.style.visible : snap.style.visible);
+
+    batch.items.forEach(function (it) {
+      snap.items[it.id] = {
+        ready: true,                // 强制应用（读取中的项空值无妨，读完会填回来）
+        values: Object.assign({}, it.baseValues),
+        geoSource: it.gps ? 'auto' : 'none',
+        geoFailed: false,
+        geoAsked: false,
+        hasExif: !!it.baseHasExif,
+        gps: it.baseGps ? { latitude: it.baseGps.latitude, longitude: it.baseGps.longitude } : null,
+        userEdited: false
+      };
+    });
+    return snap;
+  }
+
+  // 一键重置：样式回默认（边框按当前图片尺寸重算，等同刚载入），拍摄信息回到 EXIF 值
+  function resetAll() {
+    if (batch.exporting) { showNotice('正在导出，导出过程中不能重置。', 'warn'); return; }
+    if (!history.base) return;
+
+    pushHistory('reset', true);
+    applyDoc(resetDoc(), true);
+
+    if (state.img) {
+      setupRangesForImage(state.img.naturalWidth, state.img.naturalHeight);
+      syncSizeControl();
+      updatePreview();
+    }
+
+    const cur = activeItem();
+    if (cur) {
+      geoInput.value = state.hideLocation ? '' : cleanStr(cur.values.location);
+      syncGeoStatus(cur);
+      maybeQueryPlaceName(cur);     // 与刚载入一致：单张有 GPS 就自动反查一次
+    }
+
+    showNotice('已恢复默认设置与拍摄信息（Ctrl / ⌘ + Z 可撤回）。', 'ok');
+    syncHistoryUI();
+  }
+
+  function setRangePair(rangeEl, numEl, v) {
+    const min = Number(rangeEl.min) || 0;
+    const max = Number(rangeEl.max) || v;
+    const clamped = Math.min(Math.max(Number(v) || 0, min), max);
+    rangeEl.value = String(clamped);
+    numEl.value = String(clamped);
+  }
+
+
   /* ---------------- 初始化 ---------------- */
   function init() {
     buildFields();
     buildChips();
     buildLogoPicker();
+    history.base = docSnapshot();     // 默认设置快照：「重置」的基准（此时队列还是空的）
 
     bindPair(borderRange, borderNum, function (v) {
       state.borderWidth = v;
@@ -2792,6 +3089,52 @@
       if (e.key === 'ArrowLeft') { stepItem(-1); e.preventDefault(); }
       else if (e.key === 'ArrowRight') { stepItem(1); e.preventDefault(); }
     });
+
+    /* ---------- 撤回 / 重做 / 重置 ---------- */
+    undoBtn.addEventListener('click', undo);
+    redoBtn.addEventListener('click', redo);
+    resetBtn.addEventListener('click', resetAll);
+
+    // Ctrl / ⌘ + Z 撤回，加 Shift（或 Ctrl + Y）重做。文本框里也接管：
+    // 文档级撤回已经覆盖输入框内容，避免两套历史互相打架。
+    document.addEventListener('keydown', function (e) {
+      if (e.isComposing || e.altKey) return;
+      if (!(e.metaKey || e.ctrlKey)) return;
+      const key = String(e.key || '').toLowerCase();
+      if (key === 'z') {
+        e.preventDefault();
+        if (e.shiftKey) redo(); else undo();
+      } else if (key === 'y') {
+        e.preventDefault();
+        redo();
+      }
+    });
+
+    // 设置区里任何一次改动前先记一步快照（捕获阶段 → 各控件自己的处理函数还没跑）
+    if (settingsPane) {
+      const stepKey = function (t) {
+        if (!t) return '';
+        if (t.id) return t.id;                       // 同一控件连续改动 → 合并
+        if (t.name) return t.name + ':' + t.value;   // 单选按钮各自算一步
+        return '';
+      };
+      const onEdit = function (e) {
+        const t = e.target;
+        if (!t || t.type === 'file') return;
+        const continuous = t.tagName === 'INPUT' &&
+          /^(range|number|text|search|color)$/.test(t.type);
+        pushHistory(continuous ? stepKey(t) : '');
+      };
+      settingsPane.addEventListener('input', onEdit, true);
+      settingsPane.addEventListener('change', onEdit, true);
+      settingsPane.addEventListener('click', function (e) {
+        const btn = e.target && e.target.closest ? e.target.closest('button') : null;
+        if (!btn) return;
+        if (btn.id === 'fitBtn') pushHistory('fit');
+        else if (btn.id === 'geoRetry') pushHistory('geo');
+        else if (btn.classList.contains('logo-opt')) pushHistory('logo');
+      }, true);
+    }
 
     dropzone.addEventListener('click', function (e) {
       if (e.target === fileInput) return;      // 忽略 input.click() 冒泡上来的那次

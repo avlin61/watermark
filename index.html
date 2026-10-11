@@ -19,6 +19,15 @@
       <h1>水印框</h1>
       <span class="tagline">本地处理 · 不上传服务器</span>
     </div>
+
+    <div class="topbar-actions">
+      <button class="btn-ghost" id="undoBtn" type="button" disabled
+              title="撤回上一步改动（Ctrl / ⌘ + Z）" aria-label="撤回">↺ 撤回</button>
+      <button class="btn-ghost" id="redoBtn" type="button" disabled
+              title="重做（Ctrl / ⌘ + Shift + Z）" aria-label="重做">↻ 重做</button>
+      <button class="btn-ghost" id="resetBtn" type="button"
+              title="恢复默认样式，并把拍摄信息回到刚读取时的 EXIF 值（可撤回）">重置</button>
+    </div>
   </header>
 
   <main class="app">
@@ -361,7 +370,8 @@
         </div>
       </details>
 
-      <p class="footnote">所有处理均在浏览器本地完成，照片不会上传到任何服务器。</p>
+      <p class="footnote">所有处理均在浏览器本地完成，照片不会上传到任何服务器。<br />
+        快捷键：Ctrl / ⌘ + Z 撤回设置改动 · Ctrl / ⌘ + Shift + Z（或 Ctrl + Y）重做。队列里图片的增删不参与撤回。</p>
     </aside>
   </main>
 
