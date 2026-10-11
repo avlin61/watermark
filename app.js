@@ -1,6 +1,7 @@
 /* ============================================================
    水印框 · 图片信息水印工具
    第二阶段：虚化背景 / 文字样式 / 字段开关 / 地理位置反查 / 自定义文案
+   第三阶段：内置矢量 LOGO（文字 or LOGO）/ 像素级文字高度
    全部逻辑在浏览器本地执行，照片不会被上传。
    ============================================================ */
 
@@ -59,6 +60,16 @@
   const valignRadios   = arr(document.querySelectorAll('input[name="valign"]'));
   const iconChk        = $('iconChk');
 
+  const brandStyleRadios = arr(document.querySelectorAll('input[name="brandStyle"]'));
+  const logoStatusEl   = $('logoStatus');
+  const logoGridWrap   = $('logoGrid');
+  const logoPickCtl    = $('logoPickControl');
+  const logoNameEl     = $('logoName');
+  const logoSizeCtl    = $('logoSizeControl');
+  const logoSizeRange  = $('logoSizeRange');
+  const logoSizeValEl  = $('logoSizeVal');
+  const sizeHintEl     = $('sizeHint');
+
   const formatRadios   = arr(document.querySelectorAll('input[name="format"]'));
   const qualityRow     = $('qualityRow');
   const qualityRange   = $('qualityRange');
@@ -92,6 +103,33 @@
       'M3 10h18'
     ]
   };
+
+  /* ---------------- 内置 LOGO 库 ---------------- */
+  // 资源由同目录的 logos.js 提供（本地矢量路径，无需联网、无需用户上传）
+  const LOGO_SRC = (window.WM_LOGOS && window.WM_LOGOS.brands && window.WM_LOGOS.marks)
+    ? window.WM_LOGOS
+    : { brands: [], marks: [] };
+
+  const LOGO_ITEMS = Object.create(null);   // key → { key, name, d, stroke }
+  const LOGO_BRAND_KEYS = [];               // 品牌 LOGO 顺序（选择器用）
+  const LOGO_MARK_KEYS = [];                // 通用标记顺序
+  const BRAND_LOGO_RULES = [];              // [RegExp, key]
+  const LOGO_CAP = 0.72;                    // LOGO 字形高度 / 文字高度 的默认比值
+  const LOGO_FALLBACK = 'aperture';         // 无匹配品牌时的通用标记
+
+  (function initLogoLib() {
+    LOGO_SRC.brands.forEach(function (b) {
+      LOGO_ITEMS[b.key] = { key: b.key, name: b.name, d: b.d, stroke: 0 };
+      LOGO_BRAND_KEYS.push(b.key);
+      (b.match || []).forEach(function (p) {
+        try { BRAND_LOGO_RULES.push([new RegExp(p, 'i'), b.key]); } catch (e) { /* 忽略非法正则 */ }
+      });
+    });
+    LOGO_SRC.marks.forEach(function (m) {
+      LOGO_ITEMS[m.key] = { key: m.key, name: m.name, d: m.d, stroke: Number(m.stroke) || 0 };
+      LOGO_MARK_KEYS.push(m.key);
+    });
+  }());
 
   // 各行的自动字号（相对照片短边）与字重
   const KIND_STYLE = {
@@ -154,6 +192,9 @@
     align: 'left',
     valign: 'middle',
     icons: true,
+    brandStyle: 'text',   // text | logo | both
+    logoKey: 'auto',      // auto（按品牌匹配）或具体 LOGO key
+    logoScale: 1,         // LOGO 高度相对文字高度的比例
     format: 'png',
     quality: 0.92
   };
@@ -246,6 +287,230 @@
     ctx.lineJoin = 'round';
     for (let i = 0; i < paths.length; i++) ctx.stroke(new Path2D(paths[i]));
     ctx.restore();
+  }
+
+  /* ---------------- 内置 LOGO：度量与绘制 ---------------- */
+  const logoBoxCache = Object.create(null);   // key → 字形外框（24 单位坐标系）
+
+  // 在 24 单位坐标系里绘制一个 LOGO（度量与正式绘制共用同一套画笔）
+  function paintLogo(ctx, item, x, y, scale, color) {
+    const p = new Path2D(item.d);
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.scale(scale, scale);
+    if (item.stroke) {
+      ctx.lineWidth = item.stroke;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = color;
+      ctx.stroke(p);
+    } else {
+      ctx.fillStyle = color;
+      ctx.fill(p);
+    }
+    ctx.restore();
+  }
+
+  // 量出 LOGO 的真实字形外框（含描边），让不同 LOGO 的视觉高度保持一致
+  function logoBox(key) {
+    if (logoBoxCache[key]) return logoBoxCache[key];
+
+    const item = LOGO_ITEMS[key];
+    let box = { x0: 0, y0: 0, x1: 24, y1: 24 };   // 兜底：整块 24 单位框
+    if (item && hasPath2D()) {
+      const S = 240;            // 离屏画布边长
+      const M = 8;              // 四周留白（24 单位之外的余量，避免描边被裁）
+      const scale = S / (24 + M * 2);
+      try {
+        const c = document.createElement('canvas');
+        c.width = c.height = S;
+        const ctx = c.getContext('2d');
+        paintLogo(ctx, item, M * scale, M * scale, scale, '#fff');
+        const data = ctx.getImageData(0, 0, S, S).data;
+        let x0 = S, y0 = S, x1 = -1, y1 = -1;
+        for (let y = 0; y < S; y++) {
+          for (let x = 0; x < S; x++) {
+            if (data[(y * S + x) * 4 + 3] > 16) {
+              if (x < x0) x0 = x;
+              if (x > x1) x1 = x;
+              if (y < y0) y0 = y;
+              if (y > y1) y1 = y;
+            }
+          }
+        }
+        if (x1 >= x0 && y1 >= y0) {
+          box = {
+            x0: x0 / scale - M,
+            y0: y0 / scale - M,
+            x1: (x1 + 1) / scale - M,
+            y1: (y1 + 1) / scale - M
+          };
+        }
+      } catch (e) { /* 无法读取像素时退回整块框 */ }
+    }
+    box.aspect = (box.x1 - box.x0) / Math.max(1e-6, box.y1 - box.y0);
+    logoBoxCache[key] = box;
+    return box;
+  }
+
+  // 以“字形高度 = h 像素”绘制 LOGO，(x, y) 为字形左上角，返回实际宽度
+  function drawLogo(ctx, key, x, y, h, color) {
+    const item = LOGO_ITEMS[key];
+    if (!item || !hasPath2D() || !(h > 0)) return 0;
+    const box = logoBox(key);
+    const s = h / Math.max(1e-6, box.y1 - box.y0);
+    paintLogo(ctx, item, x - box.x0 * s, y - box.y0 * s, s, color);
+    return (box.x1 - box.x0) * s;
+  }
+
+  function logoWidth(key, h) {
+    return logoBox(key).aspect * h;
+  }
+
+  // 按 EXIF 品牌名匹配内置 LOGO
+  function matchBrandLogo() {
+    const brand = cleanStr(state.meta.brand);
+    if (!brand) return null;
+    for (let i = 0; i < BRAND_LOGO_RULES.length; i++) {
+      if (BRAND_LOGO_RULES[i][0].test(brand)) return BRAND_LOGO_RULES[i][1];
+    }
+    return null;
+  }
+
+  // 当前实际使用的 LOGO（自动匹配 / 手动指定 / 通用兜底）
+  function resolveLogoKey() {
+    if (state.logoKey !== 'auto' && LOGO_ITEMS[state.logoKey]) return state.logoKey;
+    return matchBrandLogo() || LOGO_FALLBACK;
+  }
+
+  function showLogoMark() {
+    if (state.brandStyle === 'text' || !hasPath2D() || !state.visible.brand) return false;
+    return !!LOGO_ITEMS[resolveLogoKey()];   // 资源缺失（logos.js 未加载）时退回文字
+  }
+
+  function showBrandText() {
+    return state.brandStyle === 'text' || state.brandStyle === 'both';
+  }
+
+  /* ---------------- 品牌标识 UI（文字 / LOGO 选择器） ---------------- */
+  function svgForLogo(item) {
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('viewBox', '0 0 24 24');
+    svg.setAttribute('aria-hidden', 'true');
+    svg.setAttribute('focusable', 'false');
+    const path = document.createElementNS(ns, 'path');
+    path.setAttribute('d', item.d);
+    if (item.stroke) {
+      path.setAttribute('fill', 'none');
+      path.setAttribute('stroke', 'currentColor');
+      path.setAttribute('stroke-width', String(item.stroke));
+      path.setAttribute('stroke-linecap', 'round');
+      path.setAttribute('stroke-linejoin', 'round');
+    } else {
+      path.setAttribute('fill', 'currentColor');
+    }
+    svg.appendChild(path);
+    return svg;
+  }
+
+  function buildLogoPicker() {
+    if (!logoGridWrap) return;
+    logoGridWrap.innerHTML = '';
+
+    const list = [{ key: 'auto', name: '自动（按品牌匹配）' }];
+    LOGO_BRAND_KEYS.forEach(function (k) {
+      list.push({ key: k, name: '品牌 · ' + LOGO_ITEMS[k].name, item: LOGO_ITEMS[k] });
+    });
+    LOGO_MARK_KEYS.forEach(function (k) {
+      list.push({ key: k, name: '通用标记 · ' + LOGO_ITEMS[k].name, item: LOGO_ITEMS[k] });
+    });
+
+    if (list.length === 1) {
+      const tip = document.createElement('p');
+      tip.className = 'hint';
+      tip.textContent = 'LOGO 资源未加载（缺少 logos.js），请改用文字模式或检查文件是否完整。';
+      logoGridWrap.appendChild(tip);
+      return;
+    }
+
+    list.forEach(function (opt) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'logo-opt' + (state.logoKey === opt.key ? ' on' : '');
+      btn.title = opt.name;
+      btn.setAttribute('aria-label', opt.name);
+      btn.dataset.logoKey = opt.key;
+      if (opt.item) btn.appendChild(svgForLogo(opt.item));
+      else btn.textContent = '自动';
+      btn.addEventListener('click', function () {
+        state.logoKey = opt.key;
+        buildLogoPicker();
+        syncLogoStatus();
+        schedulePreview();
+      });
+      logoGridWrap.appendChild(btn);
+    });
+  }
+
+  function syncLogoStatus() {
+    if (!logoStatusEl) return;
+    const brand = cleanStr(state.meta.brand);
+    const matched = matchBrandLogo();
+    let text;
+    let kind;
+
+    if (state.logoKey !== 'auto') {
+      const it = LOGO_ITEMS[state.logoKey];
+      text = '手动选择 · ' + (it ? it.name : '—');
+      kind = 'ok';
+    } else if (!brand) {
+      text = '品牌为空 · 用通用标记';
+      kind = 'warn';
+    } else if (matched) {
+      text = '已匹配 ' + LOGO_ITEMS[matched].name;
+      kind = 'ok';
+    } else {
+      text = '未内置 ' + brand + ' · 用通用标记';
+      kind = 'warn';
+    }
+
+    logoStatusEl.textContent = text;
+    logoStatusEl.title = text;
+    logoStatusEl.className = 'mini-status ' + kind;
+
+    if (logoNameEl) {
+      const cur = LOGO_ITEMS[resolveLogoKey()];
+      logoNameEl.textContent = (cur ? cur.name : '—') + (state.logoKey === 'auto' ? ' · 自动' : '');
+    }
+  }
+
+  function applyBrandStyle() {
+    const noLib = !LOGO_BRAND_KEYS.length && !LOGO_MARK_KEYS.length;
+    const needLogo = state.brandStyle !== 'text';
+
+    if (needLogo && (!hasPath2D() || noLib)) {
+      state.brandStyle = 'text';
+      brandStyleRadios.forEach(function (r) { r.checked = r.value === 'text'; });
+      showNotice(noLib
+        ? 'LOGO 资源（logos.js）未加载，已改用文字模式。'
+        : '当前浏览器不支持矢量 LOGO 绘制（Path2D），已改用文字模式。', 'warn');
+    }
+
+    // LOGO 跟随「品牌」勾选显示，切换到 LOGO 模式时自动补勾，避免什么都看不到
+    if (state.brandStyle !== 'text' && chipInputs.brand && !chipInputs.brand.checked) {
+      chipInputs.brand.checked = true;
+      state.visible.brand = true;
+    }
+
+    const showCtl = state.brandStyle !== 'text';
+    logoPickCtl.classList.toggle('hidden', !showCtl);
+    logoSizeCtl.classList.toggle('hidden', !showCtl);
+
+    buildLogoPicker();
+    syncLogoSizeLabel();
+    syncLogoStatus();
+    schedulePreview();
   }
 
   /* ---------------- 通知 / 徽标 ---------------- */
@@ -455,6 +720,7 @@
       input.spellcheck = false;
       input.addEventListener('input', function () {
         state.meta[def.key] = input.value;
+        if (def.key === 'brand') syncLogoStatus();   // 品牌变化会改变 LOGO 的自动匹配
         updatePreview();
       });
 
@@ -471,6 +737,7 @@
       state.meta[def.key] = v;
       if (fieldInputs[def.key]) fieldInputs[def.key].value = v;
     });
+    syncLogoStatus();
   }
 
   /* ---------------- 内容勾选 ---------------- */
@@ -504,6 +771,54 @@
     });
   }
 
+  /* ---------------- 文字高度（像素级滑块） ---------------- */
+  // 标题行（品牌 / 型号）的自动高度 = 照片短边 × 3%，滑块以“输出像素”为单位微调
+  const TITLE_SIZE = KIND_STYLE.title.size;
+
+  function shortSide() {
+    return state.img ? Math.min(state.img.naturalWidth, state.img.naturalHeight) : 0;
+  }
+
+  function titleAutoPx() {
+    return shortSide() * TITLE_SIZE;
+  }
+
+  function currentTitlePx() {
+    return titleAutoPx() * state.fontScale;
+  }
+
+  function syncSizeControl() {
+    const auto = titleAutoPx();
+
+    if (!(auto > 0)) {
+      sizeRange.disabled = true;
+      sizeValEl.textContent = '—';
+      sizeHintEl.textContent = '载入图片后可按像素精确调整（步进 1px）。';
+      syncLogoSizeLabel();
+      return;
+    }
+
+    const px = Math.max(1, Math.round(auto * state.fontScale));
+    const min = Math.max(4, Math.round(auto * 0.35));
+    const max = Math.max(min + 4, Math.round(auto * 3.2));
+
+    sizeRange.disabled = false;
+    sizeRange.min = String(min);
+    sizeRange.max = String(max);
+    sizeRange.value = String(Math.min(Math.max(px, min), max));
+    sizeValEl.textContent = px + ' px';
+    sizeHintEl.textContent = '自动 ' + Math.round(auto) + 'px（短边 ' + (TITLE_SIZE * 100).toFixed(1) +
+      '%） · 当前为短边 ' + (px / Math.max(1, shortSide()) * 100).toFixed(2) + '% · 步进 1px';
+
+    syncLogoSizeLabel();
+  }
+
+  function syncLogoSizeLabel() {
+    const pct = Math.round(state.logoScale * 100);
+    const px = Math.round(currentTitlePx() * LOGO_CAP * state.logoScale);
+    logoSizeValEl.textContent = px > 0 ? pct + '% · ' + px + 'px' : pct + '%';
+  }
+
   /* ---------------- 尺寸范围 ---------------- */
   function setupRangesForImage(w, h) {
     const base = Math.min(w, h);
@@ -521,6 +836,9 @@
 
     borderRange.value = borderNum.value = String(bDef);
     bottomRange.value = bottomNum.value = String(eDef);
+
+    syncSizeControl();
+    syncLogoSizeLabel();
   }
 
   function bindPair(rangeEl, numEl, onChange) {
@@ -606,11 +924,12 @@
       rows.push({ kind: 'custom', text: custom });
     }
 
+    const logoKey = showLogoMark() ? resolveLogoKey() : null;
     const title = [];
-    if (v.brand) title.push(cleanStr(m.brand));
+    if (v.brand && showBrandText()) title.push(cleanStr(m.brand));
     if (v.model) title.push(cleanStr(m.model));
     const titleText = title.filter(Boolean).join(' ');
-    if (titleText) rows.push({ kind: 'title', text: titleText });
+    if (titleText || logoKey) rows.push({ kind: 'title', text: titleText, logo: logoKey });
 
     const specs = [];
     if (v.lens)     specs.push(cleanStr(m.lens));
@@ -649,7 +968,8 @@
   function measureRows(ctx, rows, box, stack, f) {
     const base = box.base;
     const iconsOn = state.icons && hasPath2D();
-    const out = { sizes: [], widths: [], rowH: [], gaps: [], items: [], sepW: [], blockH: 0, maxW: 0 };
+    const out = { sizes: [], widths: [], rowH: [], gaps: [], items: [], sepW: [],
+                  logoH: [], logoW: [], logoGap: [], blockH: 0, maxW: 0 };
 
     for (let i = 0; i < rows.length; i++) {
       const row = rows[i];
@@ -682,7 +1002,17 @@
         }
         w = total;
       } else {
-        w = ctx.measureText(row.text).width;
+        w = row.text ? ctx.measureText(row.text).width : 0;
+        // 标题行前面可能有内置 LOGO：生成高度按文字高度比例算，宽度按字形比例算
+        if (row.logo) {
+          const lh = size * LOGO_CAP * state.logoScale;
+          const lw = logoWidth(row.logo, lh);
+          const gap = row.text ? size * 0.34 : 0;
+          out.logoH[i] = lh;
+          out.logoW[i] = lw;
+          out.logoGap[i] = gap;
+          w += lw + gap;
+        }
       }
 
       out.widths[i] = w;
@@ -764,7 +1094,13 @@
           cx += it.textW;
         });
       } else {
-        ctx.fillText(row.text, x, y);
+        let tx = x;
+        if (row.logo) {
+          const lh = metrics.logoH[i] || 0;
+          drawLogo(ctx, row.logo, x, y + (size - lh) / 2, lh, color);
+          tx = x + (metrics.logoW[i] || 0) + (row.text ? (metrics.logoGap[i] || 0) : 0);
+        }
+        if (row.text) ctx.fillText(row.text, tx, y);
       }
       ctx.restore();
 
@@ -1052,6 +1388,7 @@
   function init() {
     buildFields();
     buildChips();
+    buildLogoPicker();
 
     bindPair(borderRange, borderNum, function (v) {
       state.borderWidth = v;
@@ -1141,8 +1478,26 @@
     });
 
     sizeRange.addEventListener('input', function () {
-      state.fontScale = Number(sizeRange.value);
-      sizeValEl.textContent = Math.round(state.fontScale * 100) + '%';
+      const auto = titleAutoPx();
+      if (!(auto > 0)) return;
+      const px = Number(sizeRange.value);
+      state.fontScale = px / auto;         // 内部仍以比例存储，保证预览/导出与不同分辨率一致
+      sizeValEl.textContent = px + ' px';
+      syncSizeControl();                   // 刷新提示与 LOGO 高度换算
+      schedulePreview();
+    });
+
+    brandStyleRadios.forEach(function (r) {
+      r.addEventListener('change', function () {
+        if (!r.checked) return;
+        state.brandStyle = r.value;
+        applyBrandStyle();
+      });
+    });
+
+    logoSizeRange.addEventListener('input', function () {
+      state.logoScale = Number(logoSizeRange.value);
+      syncLogoSizeLabel();
       schedulePreview();
     });
 
@@ -1219,6 +1574,8 @@
     qualityRow.classList.add('hidden');
     syncTextColorInput();
     applyMode();
+    syncSizeControl();
+    applyBrandStyle();
   }
 
   init();

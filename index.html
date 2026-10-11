@@ -145,6 +145,42 @@
         <summary><span class="sect-title">内容</span></summary>
         <div class="sect-body">
           <div class="chips" id="contentChips"></div>
+
+          <div class="control">
+            <div class="control-label">
+              <span>品牌标识</span>
+              <span class="mini-status" id="logoStatus">—</span>
+            </div>
+            <div class="segmented" role="radiogroup" aria-label="品牌标识样式">
+              <label>
+                <input type="radio" name="brandStyle" value="text" checked />
+                <span>文字</span>
+              </label>
+              <label>
+                <input type="radio" name="brandStyle" value="logo" />
+                <span>LOGO</span>
+              </label>
+              <label>
+                <input type="radio" name="brandStyle" value="both" />
+                <span>LOGO + 文字</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="control hidden" id="logoPickControl">
+            <div class="control-label">
+              <span>选择 LOGO</span>
+              <span class="mini-status" id="logoName">—</span>
+            </div>
+            <div class="logo-grid" id="logoGrid"></div>
+          </div>
+
+          <div class="control hidden" id="logoSizeControl">
+            <div class="control-label"><span>LOGO 高度</span><b id="logoSizeVal">100%</b></div>
+            <input type="range" id="logoSizeRange" min="0.5" max="2" step="0.05" value="1" />
+          </div>
+
+          <p class="hint">LOGO 为内置矢量图形，不需要上传图片，导出放大到任何分辨率都清晰；默认按 EXIF 品牌自动匹配，未内置的品牌会使用通用标记。</p>
           <div class="control">
             <div class="control-label"><span>自定义文案</span></div>
             <input type="text" id="customText" placeholder="如：2024 秋 · 川西行" autocomplete="off" spellcheck="false" />
@@ -166,7 +202,7 @@
       </details>
 
       <!-- ④ 文字样式 -->
-      <details class="sect">
+      <details class="sect" open>
         <summary><span class="sect-title">文字样式</span></summary>
         <div class="sect-body">
           <div class="control">
@@ -181,8 +217,9 @@
           </div>
 
           <div class="control">
-            <div class="control-label"><span>字号</span><b id="sizeVal">100%</b></div>
-            <input type="range" id="sizeRange" min="0.5" max="2" step="0.05" value="1" />
+            <div class="control-label"><span>文字高度</span><b id="sizeVal">—</b></div>
+            <input type="range" id="sizeRange" min="8" max="240" step="1" value="60" disabled />
+            <p class="hint" id="sizeHint">载入图片后可按像素精确调整（步进 1px）。</p>
           </div>
 
           <div class="control">
@@ -255,6 +292,8 @@
 
   <!-- EXIF 解析库（CDN） -->
   <script src="https://cdn.jsdelivr.net/npm/exifr/dist/full.umd.js"></script>
+  <!-- 内置 LOGO 资源库（本地矢量路径，无需联网） -->
+  <script src="logos.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
